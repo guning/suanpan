@@ -44,10 +44,20 @@ Transfers are their own command — don't model them as a paired expense+income.
 
 ## Resolving inputs before writing
 
-The user almost always speaks in names, not ids. Resolve first using `-json`:
+### Default person / family — read your persona first
 
-1. `suanpan family list -json` → pick or create family.
-2. `suanpan person list -json` (optionally `-family <id>`) → resolve person id.
+Your **deployment context (persona / system prompt / SOUL.md)** is the source of truth for which `person` and `family` you book to by default. If it names a person + id (e.g. "you serve noreen, person id=1, family id=1"), use those as the default `-person` / `-family` for `txn add` / `txn transfer` / `budget add` etc. Don't re-ask the user "who is this for" — they already told the operator when they set up your profile.
+
+Override the default **only** when the user explicitly says "给 X 记一笔" / "this one is for X" / "家里共同的那笔" — then look up that other person/family before writing.
+
+If no persona binding is given, fall back to asking once.
+
+### Resolve everything else from names
+
+The user almost always speaks in names, not ids. Resolve via `-json`:
+
+1. `suanpan family list -json` → pick or create family (skip if persona pins one).
+2. `suanpan person list -json` (optionally `-family <id>`) → resolve person id (skip if persona pins one).
 3. `suanpan account list -json` (with `-owner person:N` or `-owner family:N`) → resolve account id.
 4. `suanpan category list -json` (optionally `-kind expense`) → resolve category id. `txn add` also accepts `-category-name` and will auto-resolve.
 
