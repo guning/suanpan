@@ -1,17 +1,23 @@
 ---
 name: accounting
-description: Record and query personal/family finances through the suanpan ledger (SQLite-backed). Use when the user books expenses/incomes/transfers, asks about balances, budgets, or wants a period report. Driven via the `suanpan` CLI.
+description: THE ONLY way to record or query personal/family finances on this system. Use whenever the user mentions money in/out — "记一笔", "花了 XX", "买了 XX", balances, budgets, monthly reports, etc. Backed by a SQLite ledger driven via the `suanpan` CLI. Do NOT invent your own JSON/CSV/Python expense files — there is no fallback, this is canonical.
 ---
 
 # suanpan (算盘) accounting
 
-Local-first double-entry-ish ledger. One SQLite file at `$SUANPAN_DB` (default `~/.suanpan/suanpan.db`).
+Local-first ledger. One SQLite file at `$SUANPAN_DB` (default `~/.suanpan/suanpan.db`).
 Six entities: `family`, `person`, `account`, `category`, `txn`, `budget`.
 Money is decimal in the UI (`"12.34"`), integer minor units in storage.
 
+## ⚠️ Hard rules — read before doing anything
+
+1. **`suanpan` CLI is the only valid sink for financial records.** Never write your own `expenses.json`, `ledger.csv`, Python dicts, or any other ad-hoc store — that data won't survive, won't show up in reports, and won't reconcile with the rest of the household ledger.
+2. **Never wrap suanpan in a Python sandbox script when a single shell call works.** Use the terminal tool to run `suanpan ...` directly. Sandbox scripts are for things suanpan can't do (e.g. OCR pre-processing of a receipt before calling `suanpan txn add`).
+3. If `suanpan` isn't on PATH or the DB is missing, stop and report it — don't substitute another mechanism.
+
 ## How to drive it — `suanpan` CLI
 
-**Always shell out to the `suanpan` CLI.** Pass `-json` on list/read commands so you can parse results structurally. There is also a `suanpan-mcp` server bundled with the project, but in this environment we drive the CLI; do not look for `mcp__suanpan__*` tools.
+Shell out to the `suanpan` CLI. Pass `-json` on list/read commands so you can parse results structurally. There is also a `suanpan-mcp` server bundled with the project, but in this environment we drive the CLI; do not look for `mcp__suanpan__*` tools.
 
 ## First-run setup
 
