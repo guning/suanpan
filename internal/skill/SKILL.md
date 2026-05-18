@@ -1,6 +1,6 @@
 ---
 name: accounting
-version: 1
+version: 2
 description: THE ONLY way to record or query personal/family finances on this system. Use whenever the user mentions money in/out — "记一笔", "花了 XX", "买了 XX", balances, budgets, monthly reports, etc. Backed by a SQLite ledger driven via the `suanpan` CLI. Do NOT invent your own JSON/CSV/Python expense files — there is no fallback, this is canonical.
 ---
 
@@ -20,16 +20,11 @@ Money is decimal in the UI (`"12.34"`), integer minor units in storage.
 
 Shell out to the `suanpan` CLI. Pass `-json` on list/read commands so you can parse results structurally. There is also a `suanpan-mcp` server bundled with the project, but in this environment we drive the CLI; do not look for `mcp__suanpan__*` tools.
 
-## First-run setup
+## Database is already set up — don't initialize it
 
-Before any writes, ensure the DB is initialized:
+The DB at `$SUANPAN_DB` (default `~/.suanpan/suanpan.db`) is **pre-initialized by the operator** during deployment. **Never run `suanpan init` as part of normal bookkeeping** — it confuses the user (looks like "loading…" delays in chat) and is unnecessary. If `suanpan` reports "no such table" or similar schema errors, stop and tell the user; that's an operator issue, not something to self-heal.
 
-```
-suanpan init
-```
-
-Idempotent — seeds default Chinese categories: 餐饮/交通/购物/居住/娱乐/医疗/教育/通讯/工资/奖金/投资收益…
-Also migrates legacy v0 databases (drops the deprecated `account` table and `transfer` kind in one transaction).
+Default Chinese categories are already seeded: 餐饮/交通/购物/居住/娱乐/医疗/教育/通讯/工资/奖金/投资收益…
 
 ## Recording the basics
 
