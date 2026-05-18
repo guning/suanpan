@@ -36,21 +36,13 @@ func cmdInstallSkill(args []string) error {
 	}
 	skillFile := filepath.Join(skillDir, "SKILL.md")
 
-	// 1. Install SKILL.md.
+	// 1. Install SKILL.md. Auto-upgrade when the bundled version is newer than
+	// the installed one; otherwise leave hand-edits alone unless -force is set.
+	embedVer := skill.Version()
 	if *dry {
-		fmt.Printf("[dry-run] write %d bytes -> %s\n", len(skill.Content), skillFile)
-	} else {
-		if _, err := os.Stat(skillFile); err == nil && !*force {
-			fmt.Fprintf(os.Stderr, "%s already exists (use -force to overwrite)\n", skillFile)
-		} else {
-			if err := os.MkdirAll(skillDir, 0o755); err != nil {
-				return fmt.Errorf("mkdir: %w", err)
-			}
-			if err := os.WriteFile(skillFile, []byte(skill.Content), 0o644); err != nil {
-				return fmt.Errorf("write skill: %w", err)
-			}
-			fmt.Printf("installed skill → %s\n", skillFile)
-		}
+		fmt.Printf("[dry-run] would write v%d skill (%d bytes) -> %s\n", embedVer, len(skill.Content), skillFile)
+	} else if err := writeSkill(skillFile, skillDir, embedVer, *force); err != nil {
+		return err
 	}
 
 	if *skillOnly {
@@ -99,6 +91,40 @@ func cmdInstallSkill(args []string) error {
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("claude mcp add: %w", err)
 	}
+	return nil
+}
+
+// writeSkill installs or upgrades the SKILL.md file. The version-comparison
+// branch is the heart of the auto-upgrade contract:
+//   - file missing → fresh install
+//   - installed < embedded → upgrade (silently, this is the upgrade path)
+//   - installed ≥ embedded → skip unless -force (preserves hand-edits)
+func writeSkill(skillFile, skillDir string, embedVer int, force bool) error {
+	existing, err := os.ReadFile(skillFile)
+	switch {
+	case err == nil && !force:
+		instVer := skill.ParseVersion(string(existing))
+		if instVer >= embedVer {
+			fmt.Fprintf(os.Stderr, "%s already at v%d (use -force to overwrite)\n", skillFile, instVer)
+			return nil
+		}
+		if err := os.WriteFile(skillFile, []byte(skill.Content), 0o644); err != nil {
+			return fmt.Errorf("write skill: %w", err)
+		}
+		fmt.Printf("upgraded skill v%d → v%d → %s\n", instVer, embedVer, skillFile)
+		return nil
+	case err == nil && force, os.IsNotExist(err):
+		// fresh install (or forced overwrite)
+	default:
+		return fmt.Errorf("read skill: %w", err)
+	}
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	if err := os.WriteFile(skillFile, []byte(skill.Content), 0o644); err != nil {
+		return fmt.Errorf("write skill: %w", err)
+	}
+	fmt.Printf("installed skill → %s\n", skillFile)
 	return nil
 }
 

@@ -1,5 +1,6 @@
 BIN_DIR ?= $(HOME)/.local/bin
 GO ?= go
+DEMO_DB ?= /tmp/suanpan-demo.db
 
 .PHONY: build install clean test demo serve-http
 
@@ -20,16 +21,17 @@ test:
 	$(GO) vet ./...
 	$(GO) test ./...
 
-# Wipe and re-seed a throwaway DB, then run a tiny scenario.
+# Wipe and re-seed a throwaway DB, then run a tiny end-to-end scenario covering
+# the read-scope contract (-as-person is required for report).
 demo: build
-	rm -f /tmp/suanpan-demo.db
-	SUANPAN_DB=/tmp/suanpan-demo.db ./bin/suanpan init
-	SUANPAN_DB=/tmp/suanpan-demo.db ./bin/suanpan family add -name 示例家庭
-	SUANPAN_DB=/tmp/suanpan-demo.db ./bin/suanpan person add -name 小明 -family 1
-	SUANPAN_DB=/tmp/suanpan-demo.db ./bin/suanpan account add -name 招行 -type bank -owner person:1 -initial 5000
-	SUANPAN_DB=/tmp/suanpan-demo.db ./bin/suanpan txn add -amount 35 -account 1 -kind expense -category-name 餐饮
-	SUANPAN_DB=/tmp/suanpan-demo.db ./bin/suanpan report
-	rm -f /tmp/suanpan-demo.db /tmp/suanpan-demo.db-wal /tmp/suanpan-demo.db-shm
+	rm -f $(DEMO_DB) $(DEMO_DB)-wal $(DEMO_DB)-shm
+	SUANPAN_DB=$(DEMO_DB) ./bin/suanpan init
+	SUANPAN_DB=$(DEMO_DB) ./bin/suanpan family add -name 示例家庭
+	SUANPAN_DB=$(DEMO_DB) ./bin/suanpan person add -name 小明 -family 1
+	SUANPAN_DB=$(DEMO_DB) ./bin/suanpan txn add -amount 35    -kind expense -category-name 餐饮 -person 1 -payee 沙县小吃
+	SUANPAN_DB=$(DEMO_DB) ./bin/suanpan txn add -amount 12000 -kind income  -category-name 工资 -person 1
+	SUANPAN_DB=$(DEMO_DB) ./bin/suanpan report -as-person 1
+	rm -f $(DEMO_DB) $(DEMO_DB)-wal $(DEMO_DB)-shm
 
 # Run the MCP server over HTTP on localhost:7777 (many clients supported).
 serve-http: build

@@ -1,12 +1,13 @@
 ---
 name: accounting
+version: 1
 description: THE ONLY way to record or query personal/family finances on this system. Use whenever the user mentions money in/out — "记一笔", "花了 XX", "买了 XX", balances, budgets, monthly reports, etc. Backed by a SQLite ledger driven via the `suanpan` CLI. Do NOT invent your own JSON/CSV/Python expense files — there is no fallback, this is canonical.
 ---
 
 # suanpan (算盘) accounting
 
 Local-first ledger. One SQLite file at `$SUANPAN_DB` (default `~/.suanpan/suanpan.db`).
-Six entities: `family`, `person`, `account`, `category`, `txn`, `budget`.
+Five entities: `family`, `person`, `category`, `txn`, `budget`.
 Money is decimal in the UI (`"12.34"`), integer minor units in storage.
 
 ## ⚠️ Hard rules — read before doing anything
@@ -27,45 +28,49 @@ Before any writes, ensure the DB is initialized:
 suanpan init
 ```
 
-Idempotent — seeds default Chinese categories: 餐饮/交通/购物/居住/娱乐/医疗/教育/通讯/工资/奖金/投资收益/转账…
+Idempotent — seeds default Chinese categories: 餐饮/交通/购物/居住/娱乐/医疗/教育/通讯/工资/奖金/投资收益…
+Also migrates legacy v0 databases (drops the deprecated `account` table and `transfer` kind in one transaction).
 
 ## Recording the basics
 
+Every txn needs an owner — either `-person <id>` (preferred, who actually spent the money) or `-family <id>` (shared household expense). There is no `account` concept; we record who, not where.
+
 ### Expense
 ```
-suanpan txn add -amount 28.50 -account 1 -kind expense -category-name 餐饮 -person 1 -payee 沙县小吃 -note 午饭
+suanpan txn add -amount 28.50 -kind expense -category-name 餐饮 -person 1 -payee 沙县小吃 -note 午饭
 ```
 
 ### Income
 ```
-suanpan txn add -amount 12000 -account 1 -kind income -category-name 工资 -person 1 -date 2026-04-15
+suanpan txn add -amount 12000 -kind income -category-name 工资 -person 1 -date 2026-04-15
 ```
 
-### Transfer between accounts
+### Shared household spending
 ```
-suanpan txn transfer -from 1 -to 3 -amount 500 -note 给家里
+suanpan txn add -amount 800 -kind expense -category-name 居住 -family 1 -payee 物业费
 ```
 
-Transfers are their own command — don't model them as a paired expense+income.
+## Reads are family-scoped — pass `-as-person`
 
-## Resolving inputs before writing
+`report`, `txn list`, `budget list`, and `budget status` require a caller identity so the binary can restrict results to your family (your own + siblings sharing the same `family_id` + family-tagged txns). **Other families are invisible** — this is a hard security gate, not a hint.
 
-### Default person / family — read your persona first
+Pass it either way:
+- `-as-person <id>` on each command, OR
+- export `SUANPAN_AS_PERSON=<id>` once per shell.
 
-Your **deployment context (persona / system prompt / SOUL.md)** is the source of truth for which `person` and `family` you book to by default. If it names a person + id (e.g. "you serve noreen, person id=1, family id=1"), use those as the default `-person` / `-family` for `txn add` / `txn transfer` / `budget add` etc. Don't re-ask the user "who is this for" — they already told the operator when they set up your profile.
+Your **deployment context (persona / SOUL.md)** pins which person id you are — use that as `-as-person` and as the default `-person` for writes. Don't re-ask the user "who is this for" — they already told the operator when they set up your profile.
 
-Override the default **only** when the user explicitly says "给 X 记一笔" / "this one is for X" / "家里共同的那笔" — then look up that other person/family before writing.
+Override the write default **only** when the user explicitly says "给 X 记一笔" / "this one is for X" / "家里共同的那笔" — then look up that other person/family before writing.
 
 If no persona binding is given, fall back to asking once.
 
-### Resolve everything else from names
+## Resolving inputs before writing
 
 The user almost always speaks in names, not ids. Resolve via `-json`:
 
 1. `suanpan family list -json` → pick or create family (skip if persona pins one).
 2. `suanpan person list -json` (optionally `-family <id>`) → resolve person id (skip if persona pins one).
-3. `suanpan account list -json` (with `-owner person:N` or `-owner family:N`) → resolve account id.
-4. `suanpan category list -json` (optionally `-kind expense`) → resolve category id. `txn add` also accepts `-category-name` and will auto-resolve.
+3. `suanpan category list -json` (optionally `-kind expense`) → resolve category id. `txn add` also accepts `-category-name` and will auto-resolve.
 
 If the referenced entity doesn't exist, ask the user once (single question bundling all missing facts) before creating it. Prefer `suanpan <entity> add` over guessing ids.
 
@@ -73,13 +78,12 @@ If the referenced entity doesn't exist, ask the user once (single question bundl
 
 | Ask                                              | Use                                                                  |
 | ------------------------------------------------ | -------------------------------------------------------------------- |
-| "我这个月花了多少钱"                              | `suanpan report` (defaults to current month)                         |
-| "查 4 月 1 日到 4 月 30 日的支出"                   | `suanpan report -since 2026-04-01 -until 2026-04-30`                 |
-| "我这个月餐饮花了多少"                            | `suanpan txn list -json -category <id> -since ... -until ...`, then sum |
-| "我的账户余额"                                    | `suanpan account balance -owner person:N` (or `family:N`)            |
-| "预算还剩多少"                                    | `suanpan budget status -owner person:N`                              |
-| "最近 20 笔交易"                                   | `suanpan txn list -json -limit 20`                                   |
-| "找一下周三在便利店那笔"                           | `suanpan txn list -json -search ... -since ... -until ...`           |
+| "我这个月花了多少钱"                              | `suanpan report -as-person N` (defaults to current month)            |
+| "查 4 月 1 日到 4 月 30 日的支出"                   | `suanpan report -as-person N -since 2026-04-01 -until 2026-04-30`    |
+| "我这个月餐饮花了多少"                            | `suanpan txn list -as-person N -json -category <id> -since ... -until ...`, then sum |
+| "预算还剩多少"                                    | `suanpan budget status -as-person N`                                 |
+| "最近 20 笔交易"                                   | `suanpan txn list -as-person N -json -limit 20`                      |
+| "找一下周三在便利店那笔"                           | `suanpan txn list -as-person N -json -search ... -since ... -until ...` |
 
 Run `suanpan <command> -h` whenever you're unsure of a flag — the help is the source of truth.
 
@@ -87,21 +91,20 @@ Run `suanpan <command> -h` whenever you're unsure of a flag — the help is the 
 
 - Echo amounts as decimals with the currency (e.g. `28.50 CNY`). The CLI's `-json` output may give minor units — divide by 100 when showing to the user.
 - Always include the date window when reporting totals, so the user can verify you interpreted their range correctly.
-- For "did it book?" confirmations, include txn id + date + account + amount + (payee/category if present).
+- For "did it book?" confirmations, include txn id + date + person/family + amount + (payee/category if present).
 
 ## Common pitfalls
 
 - **Amount sign**: `-amount` is always positive. The sign comes from `-kind`. Don't ask the user to pass negative numbers.
-- **Transfers are not expenses**: use `suanpan txn transfer`, not `txn add -kind expense`. Transfers don't appear in income/expense totals — they only rebalance accounts.
-- **Owner scope**: accounts and budgets are owned by exactly one of `person:N` or `family:N`. When the user says "家里的储蓄卡", pick `family:*` owner; "我的工资卡" → `person:*`.
+- **No account / no transfer**: spending accounts and inter-account transfers were removed. We only track money flowing in or out, owned by a person or a family. Don't try to model "moved money from card A to card B".
+- **Owner scope on budgets**: budgets are owned by exactly one of `person:N` or `family:N`. A `family:N` budget sums BOTH `txn.family_id=N` and any `txn.person_id` whose person belongs to family N.
 - **Categories can be global or scoped**. Default seeds are global. When `-category-name` lookup is ambiguous, the global one wins; create a scoped override only if the user asks.
-- **Destructive ops (`suanpan * rm`)**: confirm with the user before running — there is no soft-delete and no undo. Archive accounts instead of deleting them when history must be preserved.
+- **Destructive ops (`suanpan * rm`)**: confirm with the user before running — there is no soft-delete and no undo.
 
 ## Worked mini-flow
 
-User: "给我张三的招行卡记一笔今天中午 45.8 元的餐饮，在麦当劳。"
+User: "给我张三记一笔今天中午 45.8 元的餐饮，在麦当劳。" (persona pinned to person:1)
 
-1. `suanpan person list -json` → find 张三 → id=1.
-2. `suanpan account list -json -owner person:1` → find 招行 → id=1.
-3. `suanpan txn add -amount 45.80 -account 1 -kind expense -category-name 餐饮 -person 1 -payee 麦当劳 -date 2026-04-21`
-4. Respond: `已记录 #7  张三 · 招行 · 餐饮 · 45.80 CNY · 麦当劳 · 2026-04-21`.
+1. `suanpan person list -json` → confirm 张三 is person:1.
+2. `suanpan txn add -amount 45.80 -kind expense -category-name 餐饮 -person 1 -payee 麦当劳 -date 2026-04-21`
+3. Respond: `已记录 #7  张三 · 餐饮 · 45.80 CNY · 麦当劳 · 2026-04-21`.

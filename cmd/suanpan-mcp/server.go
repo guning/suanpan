@@ -106,7 +106,7 @@ func (sv *server) dispatch(req *rpcRequest) *rpcResponse {
 				"name":    "suanpan-mcp",
 				"version": "0.1.0",
 			},
-			"instructions": "Local-first accounting. Entities: family, person, account, category, txn, budget. Money is decimal (e.g. 12.34); internally stored as minor units.",
+			"instructions": "Local-first accounting. Entities: family, person, category, txn, budget. Money is decimal (e.g. 12.34); internally stored as minor units. Reads require as_person_id (or $SUANPAN_AS_PERSON) for family-scoping; cross-family data is invisible.",
 		})
 
 	case "notifications/initialized", "initialized":

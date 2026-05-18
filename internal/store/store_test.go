@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -86,8 +87,8 @@ func TestInitSeedsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cats) < 14 {
-		t.Errorf("expected >=14 seed categories, got %d", len(cats))
+	if len(cats) < 13 {
+		t.Errorf("expected >=13 seed categories, got %d", len(cats))
 	}
 	// Re-init is idempotent.
 	if err := s.Init(); err != nil {
@@ -96,6 +97,176 @@ func TestInitSeedsOnce(t *testing.T) {
 	cats2, _ := s.ListCategories("", "", 0)
 	if len(cats2) != len(cats) {
 		t.Errorf("re-init seeded extras: %d -> %d", len(cats), len(cats2))
+	}
+}
+
+// v0Schema is the legacy schema (pre-account-removal). Inlined so the test
+// pins what migration is supposed to consume — keeping it in sync with the
+// real shipped v0 isn't necessary; what matters is that the columns the
+// migration touches (account, txn.account_id, transfer kinds) are present.
+const v0Schema = `
+CREATE TABLE family (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    currency TEXT NOT NULL DEFAULT 'CNY',
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE person (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    family_id INTEGER REFERENCES family(id) ON DELETE SET NULL,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE account (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('cash','bank','credit','investment','virtual')),
+    currency TEXT NOT NULL DEFAULT 'CNY',
+    initial_balance INTEGER NOT NULL DEFAULT 0,
+    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('person','family')),
+    owner_id INTEGER NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE category (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('income','expense','transfer')),
+    parent_id INTEGER REFERENCES category(id) ON DELETE SET NULL,
+    owner_kind TEXT CHECK (owner_kind IN ('person','family')),
+    owner_id INTEGER,
+    icon TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE txn (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('income','expense','transfer')),
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    currency TEXT NOT NULL DEFAULT 'CNY',
+    account_id INTEGER NOT NULL REFERENCES account(id) ON DELETE RESTRICT,
+    counter_account_id INTEGER REFERENCES account(id) ON DELETE RESTRICT,
+    category_id INTEGER REFERENCES category(id) ON DELETE SET NULL,
+    person_id INTEGER REFERENCES person(id) ON DELETE SET NULL,
+    family_id INTEGER REFERENCES family(id) ON DELETE SET NULL,
+    payee TEXT,
+    note TEXT,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`
+
+// TestMigrateV0ToV1 exercises the v0→v1 upgrade end-to-end: build a DB with
+// the legacy schema, seed representative rows, run Init() (which detects the
+// `account` table and runs migrate_v1.sql), and assert the contract.
+func TestMigrateV0ToV1(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "v0.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if _, err := s.DB.Exec(v0Schema); err != nil {
+		t.Fatalf("apply v0 schema: %v", err)
+	}
+
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := s.DB.Exec(q, args...); err != nil {
+			t.Fatalf("seed %q: %v", q, err)
+		}
+	}
+	exec(`INSERT INTO family(id, name) VALUES (1, '张家')`)
+	exec(`INSERT INTO person(id, name, family_id) VALUES (1, '张三', 1)`)
+	exec(`INSERT INTO person(id, name, family_id) VALUES (2, '张四', 1)`)
+	// account 100 is owned by person 1; account 200 by family 1.
+	exec(`INSERT INTO account(id, name, type, owner_kind, owner_id) VALUES (100, 'cash', 'cash', 'person', 1)`)
+	exec(`INSERT INTO account(id, name, type, owner_kind, owner_id) VALUES (200, 'shared', 'bank', 'family', 1)`)
+	exec(`INSERT INTO category(id, name, kind) VALUES (10, '餐饮', 'expense')`)
+	exec(`INSERT INTO category(id, name, kind) VALUES (11, '工资', 'income')`)
+	exec(`INSERT INTO category(id, name, kind) VALUES (12, '内部转账', 'transfer')`) // must be dropped
+	// 4 txns covering the four migration branches:
+	//   id=1: transfer  → dropped
+	//   id=2: expense with explicit person_id   → preserved as-is
+	//   id=3: expense via person-owned account  → person_id backfilled
+	//   id=4: expense via family-owned account  → family_id backfilled
+	exec(`INSERT INTO txn(id, occurred_at, kind, amount, account_id, category_id) VALUES (1, '2026-04-01T00:00:00Z', 'transfer', 5000, 100, 12)`)
+	exec(`INSERT INTO txn(id, occurred_at, kind, amount, account_id, category_id, person_id) VALUES (2, '2026-04-02T00:00:00Z', 'expense', 1100, 100, 10, 2)`)
+	exec(`INSERT INTO txn(id, occurred_at, kind, amount, account_id, category_id) VALUES (3, '2026-04-03T00:00:00Z', 'expense', 2200, 100, 10)`)
+	exec(`INSERT INTO txn(id, occurred_at, kind, amount, account_id, category_id) VALUES (4, '2026-04-04T00:00:00Z', 'expense', 3300, 200, 10)`)
+
+	// Run the migration.
+	if err := s.Init(); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	// account table dropped.
+	var n int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='account'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("account table not dropped (count=%d)", n)
+	}
+
+	// schema_meta bumped to v1.
+	var ver string
+	if err := s.DB.QueryRow(`SELECT value FROM schema_meta WHERE key='version'`).Scan(&ver); err != nil {
+		t.Fatalf("schema_meta: %v", err)
+	}
+	if ver != "1" {
+		t.Errorf("schema_meta.version=%q, want 1", ver)
+	}
+
+	// transfer category dropped, expense/income survive.
+	s.DB.QueryRow(`SELECT COUNT(*) FROM category WHERE id=12`).Scan(&n)
+	if n != 0 {
+		t.Errorf("transfer category should be dropped")
+	}
+	s.DB.QueryRow(`SELECT COUNT(*) FROM category WHERE id IN (10, 11)`).Scan(&n)
+	if n != 2 {
+		t.Errorf("expense+income categories should survive, got %d", n)
+	}
+
+	// transfer txn dropped.
+	s.DB.QueryRow(`SELECT COUNT(*) FROM txn WHERE id=1`).Scan(&n)
+	if n != 0 {
+		t.Errorf("transfer txn should be dropped")
+	}
+
+	check := func(id int64, wantPerson, wantFamily sql.NullInt64) {
+		t.Helper()
+		var per, fam sql.NullInt64
+		if err := s.DB.QueryRow(`SELECT person_id, family_id FROM txn WHERE id=?`, id).Scan(&per, &fam); err != nil {
+			t.Fatalf("txn %d: %v", id, err)
+		}
+		if per != wantPerson {
+			t.Errorf("txn %d person_id=%v, want %v", id, per, wantPerson)
+		}
+		if fam != wantFamily {
+			t.Errorf("txn %d family_id=%v, want %v", id, fam, wantFamily)
+		}
+	}
+	nz := func(v int64) sql.NullInt64 { return sql.NullInt64{Int64: v, Valid: true} }
+	check(2, nz(2), sql.NullInt64{}) // explicit person preserved, family NULL
+	check(3, nz(1), sql.NullInt64{}) // backfilled from person-owned account 100
+	check(4, sql.NullInt64{}, nz(1)) // backfilled from family-owned account 200
+
+	// FK pragma is back ON after migration.
+	var fkOn int
+	if err := s.DB.QueryRow(`PRAGMA foreign_keys`).Scan(&fkOn); err != nil {
+		t.Fatal(err)
+	}
+	if fkOn != 1 {
+		t.Errorf("foreign_keys=%d after migrate, want 1", fkOn)
+	}
+
+	// Re-running Init() on a v1 DB must be a no-op (no `account` table to find).
+	if err := s.Init(); err != nil {
+		t.Fatalf("second Init: %v", err)
 	}
 }
 
@@ -120,70 +291,20 @@ func TestFamilyPersonLink(t *testing.T) {
 	}
 }
 
-func TestAccountValidatesOwner(t *testing.T) {
-	s := newTestStore(t)
-	_, err := s.CreateAccount(Account{
-		Name: "orphan", Type: "cash", OwnerKind: "person", OwnerID: 999,
-	})
-	if err == nil {
-		t.Fatal("expected error creating account for nonexistent owner")
-	}
-}
-
-// ---------- balances ----------
-
-func TestAccountBalance(t *testing.T) {
-	s := newTestStore(t)
-	p, _ := s.CreatePerson("u", nil, "")
-	a, _ := s.CreateAccount(Account{
-		Name: "招行", Type: "bank", Currency: "CNY",
-		InitialBalance: 100000, OwnerKind: "person", OwnerID: p.ID,
-	})
-	b, _ := s.CreateAccount(Account{
-		Name: "现金", Type: "cash", Currency: "CNY",
-		OwnerKind: "person", OwnerID: p.ID,
-	})
-	if _, err := s.CreateTxn(Txn{Kind: "income", Amount: 50000, AccountID: a.ID}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.CreateTxn(Txn{Kind: "expense", Amount: 20000, AccountID: a.ID}); err != nil {
-		t.Fatal(err)
-	}
-	to := b.ID
-	if _, err := s.CreateTxn(Txn{Kind: "transfer", Amount: 30000, AccountID: a.ID, CounterAccountID: &to}); err != nil {
-		t.Fatal(err)
-	}
-	balA, _ := s.AccountBalanceOf(a.ID)
-	balB, _ := s.AccountBalanceOf(b.ID)
-	if wantA := int64(100000 + 50000 - 20000 - 30000); balA != wantA {
-		t.Errorf("balA=%d, want %d", balA, wantA)
-	}
-	if balB != 30000 {
-		t.Errorf("balB=%d, want 30000", balB)
-	}
-}
-
 // ---------- transaction validation ----------
 
-func TestTransferValidation(t *testing.T) {
+func TestTxnValidation(t *testing.T) {
 	s := newTestStore(t)
 	p, _ := s.CreatePerson("u", nil, "")
-	a, _ := s.CreateAccount(Account{Name: "A", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
 
-	if _, err := s.CreateTxn(Txn{Kind: "transfer", Amount: 100, AccountID: a.ID}); err == nil {
-		t.Error("expected error on transfer without counter")
-	}
-	same := a.ID
-	if _, err := s.CreateTxn(Txn{Kind: "transfer", Amount: 100, AccountID: a.ID, CounterAccountID: &same}); err == nil {
-		t.Error("expected error on same-account transfer")
-	}
-	b, _ := s.CreateAccount(Account{Name: "B", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
-	bid := b.ID
-	if _, err := s.CreateTxn(Txn{Kind: "transfer", Amount: 0, AccountID: a.ID, CounterAccountID: &bid}); err == nil {
+	if _, err := s.CreateTxn(Txn{Kind: "expense", Amount: 0, PersonID: &p.ID}); err == nil {
 		t.Error("expected error on zero amount")
 	}
-	if _, err := s.CreateTxn(Txn{Kind: "expense", Amount: -1, AccountID: a.ID}); err == nil {
+	if _, err := s.CreateTxn(Txn{Kind: "expense", Amount: -1, PersonID: &p.ID}); err == nil {
 		t.Error("expected error on negative amount")
+	}
+	if _, err := s.CreateTxn(Txn{Kind: "transfer", Amount: 100, PersonID: &p.ID}); err == nil {
+		t.Error("expected error on unsupported transfer kind")
 	}
 }
 
@@ -231,12 +352,11 @@ func TestFindCategoryPrefersGlobal(t *testing.T) {
 func TestListTxnsFilters(t *testing.T) {
 	s := newTestStore(t)
 	p, _ := s.CreatePerson("u", nil, "")
-	a, _ := s.CreateAccount(Account{Name: "A", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
 	food, _ := s.FindCategoryByName("餐饮", "expense")
 	for _, d := range []string{"2026-04-05", "2026-04-15", "2026-04-25"} {
-		s.CreateTxn(Txn{Kind: "expense", Amount: 1000, AccountID: a.ID, CategoryID: &food.ID, OccurredAt: mustDate(t, d)})
+		s.CreateTxn(Txn{Kind: "expense", Amount: 1000, PersonID: &p.ID, CategoryID: &food.ID, OccurredAt: mustDate(t, d)})
 	}
-	s.CreateTxn(Txn{Kind: "expense", Amount: 2000, AccountID: a.ID, CategoryID: &food.ID, OccurredAt: mustDate(t, "2026-04-10"), Note: "特殊关键词"})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 2000, PersonID: &p.ID, CategoryID: &food.ID, OccurredAt: mustDate(t, "2026-04-10"), Note: "特殊关键词"})
 
 	all, _ := s.ListTxns(TxnFilter{Limit: 100})
 	if len(all) != 4 {
@@ -252,21 +372,62 @@ func TestListTxnsFilters(t *testing.T) {
 	}
 }
 
+// ---------- family scope ----------
+
+// TestScopeRestrictsToFamily exercises the security gate: scoped queries must
+// expose own + sibling + family-tagged txns, and must NOT expose another
+// family's data.
+func TestScopeRestrictsToFamily(t *testing.T) {
+	s := newTestStore(t)
+
+	famA, _ := s.CreateFamily("A家", "CNY", "")
+	famB, _ := s.CreateFamily("B家", "CNY", "")
+	alice, _ := s.CreatePerson("alice", &famA.ID, "")
+	bob, _ := s.CreatePerson("bob", &famA.ID, "")  // alice's family
+	carl, _ := s.CreatePerson("carl", &famB.ID, "") // other family
+	loner, _ := s.CreatePerson("loner", nil, "")    // no family
+
+	when := mustDate(t, "2026-04-10")
+	s.CreateTxn(Txn{Kind: "expense", Amount: 100, PersonID: &alice.ID, OccurredAt: when, Note: "alice-own"})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 200, PersonID: &bob.ID, OccurredAt: when, Note: "bob-sibling"})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 400, FamilyID: &famA.ID, OccurredAt: when, Note: "famA-shared"})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 800, PersonID: &carl.ID, OccurredAt: when, Note: "carl-other"})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 1600, FamilyID: &famB.ID, OccurredAt: when, Note: "famB-shared"})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 3200, PersonID: &loner.ID, OccurredAt: when, Note: "loner"})
+
+	// Alice's scope: own + bob + famA. Should NOT see carl, famB, loner.
+	got, err := s.ListTxns(TxnFilter{ScopePersonID: alice.ID, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotAmounts := map[int64]bool{}
+	for _, t := range got {
+		gotAmounts[t.Amount] = true
+	}
+	for amt, want := range map[int64]bool{100: true, 200: true, 400: true, 800: false, 1600: false, 3200: false} {
+		if gotAmounts[amt] != want {
+			t.Errorf("alice scope: amount=%d visible=%v, want %v", amt, gotAmounts[amt], want)
+		}
+	}
+
+	// Loner has no family — only own txns are visible (scope falls back to self).
+	got, _ = s.ListTxns(TxnFilter{ScopePersonID: loner.ID, Limit: 100})
+	if len(got) != 1 || got[0].Amount != 3200 {
+		t.Errorf("loner scope: got %+v, want only the 3200 row", got)
+	}
+}
+
 // ---------- reporting ----------
 
-func TestSummarizeExcludesTransfers(t *testing.T) {
+func TestSummarize(t *testing.T) {
 	s := newTestStore(t)
 	p, _ := s.CreatePerson("u", nil, "")
-	a, _ := s.CreateAccount(Account{Name: "A", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
-	b, _ := s.CreateAccount(Account{Name: "B", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
 	food, _ := s.FindCategoryByName("餐饮", "expense")
 	salary, _ := s.FindCategoryByName("工资", "income")
 	when := mustDate(t, "2026-04-15")
 
-	s.CreateTxn(Txn{Kind: "income", Amount: 1000000, AccountID: a.ID, CategoryID: &salary.ID, OccurredAt: when})
-	s.CreateTxn(Txn{Kind: "expense", Amount: 5000, AccountID: a.ID, CategoryID: &food.ID, OccurredAt: when})
-	bid := b.ID
-	s.CreateTxn(Txn{Kind: "transfer", Amount: 30000, AccountID: a.ID, CounterAccountID: &bid, OccurredAt: when})
+	s.CreateTxn(Txn{Kind: "income", Amount: 1000000, PersonID: &p.ID, CategoryID: &salary.ID, OccurredAt: when})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 5000, PersonID: &p.ID, CategoryID: &food.ID, OccurredAt: when})
 
 	sum, err := s.Summarize(TxnFilter{Since: "2026-04-01", Until: "2026-04-30"})
 	if err != nil {
@@ -276,13 +437,13 @@ func TestSummarizeExcludesTransfers(t *testing.T) {
 		t.Errorf("income=%d, want 1000000", sum.Income)
 	}
 	if sum.Expense != 5000 {
-		t.Errorf("expense=%d, want 5000 (transfer excluded)", sum.Expense)
+		t.Errorf("expense=%d, want 5000", sum.Expense)
 	}
 	if sum.Net != 995000 {
 		t.Errorf("net=%d", sum.Net)
 	}
-	if sum.TxnCount != 3 {
-		t.Errorf("txn_count=%d, want 3", sum.TxnCount)
+	if sum.TxnCount != 2 {
+		t.Errorf("txn_count=%d, want 2", sum.TxnCount)
 	}
 }
 
@@ -291,7 +452,7 @@ func TestSummarizeExcludesTransfers(t *testing.T) {
 func TestPeriodWindow(t *testing.T) {
 	ref := time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC) // Wednesday
 	cases := []struct {
-		period           string
+		period             string
 		wantStart, wantEnd string
 	}{
 		{"monthly", "2026-04-01", "2026-04-30"},
@@ -299,9 +460,9 @@ func TestPeriodWindow(t *testing.T) {
 		{"weekly", "2026-04-13", "2026-04-19"}, // Mon..Sun of that week
 	}
 	for _, c := range cases {
-		s, e := periodWindow(c.period, ref)
-		if s != c.wantStart || e != c.wantEnd {
-			t.Errorf("%s: %s..%s, want %s..%s", c.period, s, e, c.wantStart, c.wantEnd)
+		st, e := periodWindow(c.period, ref)
+		if st != c.wantStart || e != c.wantEnd {
+			t.Errorf("%s: %s..%s, want %s..%s", c.period, st, e, c.wantStart, c.wantEnd)
 		}
 	}
 }
@@ -309,13 +470,12 @@ func TestPeriodWindow(t *testing.T) {
 func TestBudgetStatus(t *testing.T) {
 	s := newTestStore(t)
 	p, _ := s.CreatePerson("u", nil, "")
-	a, _ := s.CreateAccount(Account{Name: "A", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
 	food, _ := s.FindCategoryByName("餐饮", "expense")
 	when := mustDate(t, "2026-04-10")
-	s.CreateTxn(Txn{Kind: "expense", Amount: 30000, AccountID: a.ID, CategoryID: &food.ID, OccurredAt: when})
-	s.CreateTxn(Txn{Kind: "expense", Amount: 20000, AccountID: a.ID, CategoryID: &food.ID, OccurredAt: when})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 30000, PersonID: &p.ID, CategoryID: &food.ID, OccurredAt: when})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 20000, PersonID: &p.ID, CategoryID: &food.ID, OccurredAt: when})
 	// A March expense (outside April window) — must not count.
-	s.CreateTxn(Txn{Kind: "expense", Amount: 77777, AccountID: a.ID, CategoryID: &food.ID, OccurredAt: mustDate(t, "2026-03-25")})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 77777, PersonID: &p.ID, CategoryID: &food.ID, OccurredAt: mustDate(t, "2026-03-25")})
 
 	overall, err := s.CreateBudget(Budget{
 		Name: "月度", Period: "monthly", Amount: 100000,
@@ -355,5 +515,63 @@ func TestBudgetStatus(t *testing.T) {
 	}
 	if st2.Remaining != -10000 {
 		t.Errorf("over-budget remaining=%d", st2.Remaining)
+	}
+}
+
+// TestBudgetFamilyOwner verifies that a family-owned budget sums txns from any
+// family member as well as family-tagged txns.
+func TestBudgetFamilyOwner(t *testing.T) {
+	s := newTestStore(t)
+	fam, _ := s.CreateFamily("A家", "CNY", "")
+	alice, _ := s.CreatePerson("alice", &fam.ID, "")
+	bob, _ := s.CreatePerson("bob", &fam.ID, "")
+	when := mustDate(t, "2026-04-10")
+
+	s.CreateTxn(Txn{Kind: "expense", Amount: 1000, PersonID: &alice.ID, OccurredAt: when})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 2000, PersonID: &bob.ID, OccurredAt: when})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 4000, FamilyID: &fam.ID, OccurredAt: when})
+
+	b, err := s.CreateBudget(Budget{
+		Name: "全家月度", Period: "monthly", Amount: 100000,
+		OwnerKind: "family", OwnerID: fam.ID, StartDate: "2026-01-01",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.BudgetStatusAt(*b, when)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Spent != 7000 {
+		t.Errorf("family-owned budget spent=%d, want 7000", st.Spent)
+	}
+}
+
+// TestListBudgetsScope verifies that another family's budget is invisible.
+func TestListBudgetsScope(t *testing.T) {
+	s := newTestStore(t)
+	famA, _ := s.CreateFamily("A家", "CNY", "")
+	famB, _ := s.CreateFamily("B家", "CNY", "")
+	alice, _ := s.CreatePerson("alice", &famA.ID, "")
+	carl, _ := s.CreatePerson("carl", &famB.ID, "")
+
+	s.CreateBudget(Budget{Name: "alice 月度", Period: "monthly", Amount: 10000, OwnerKind: "person", OwnerID: alice.ID, StartDate: "2026-01-01"})
+	s.CreateBudget(Budget{Name: "famA 月度", Period: "monthly", Amount: 10000, OwnerKind: "family", OwnerID: famA.ID, StartDate: "2026-01-01"})
+	s.CreateBudget(Budget{Name: "carl 月度", Period: "monthly", Amount: 10000, OwnerKind: "person", OwnerID: carl.ID, StartDate: "2026-01-01"})
+	s.CreateBudget(Budget{Name: "famB 月度", Period: "monthly", Amount: 10000, OwnerKind: "family", OwnerID: famB.ID, StartDate: "2026-01-01"})
+
+	bs, err := s.ListBudgets("", 0, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNames := map[string]bool{}
+	for _, b := range bs {
+		gotNames[b.Name] = true
+	}
+	if !gotNames["alice 月度"] || !gotNames["famA 月度"] {
+		t.Errorf("alice scope missing own/family budget: %v", gotNames)
+	}
+	if gotNames["carl 月度"] || gotNames["famB 月度"] {
+		t.Errorf("alice scope leaked other family's budgets: %v", gotNames)
 	}
 }

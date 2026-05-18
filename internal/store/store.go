@@ -15,6 +15,9 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+//go:embed migrate_v1.sql
+var migrateV1SQL string
+
 // Store wraps the SQLite handle and exposes high-level operations used by
 // both the CLI and MCP server.
 type Store struct {
@@ -55,12 +58,88 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.DB.Close() }
 
-// Init applies the schema and seeds default categories if none exist.
+// Init applies the schema, runs any pending migrations, and seeds default
+// categories if none exist. Safe to call repeatedly.
 func (s *Store) Init() error {
+	if err := s.migrate(); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
 	if _, err := s.DB.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	return s.seedDefaults()
+}
+
+// migrate detects legacy v0 schemas (with the `account` table) and upgrades
+// them to v1 in a single transaction. New DBs are a no-op here — schema.sql
+// will create the v1 tables.
+func (s *Store) migrate() error {
+	var hasAccount int
+	if err := s.DB.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='account'`,
+	).Scan(&hasAccount); err != nil {
+		return err
+	}
+	if hasAccount == 0 {
+		return nil // either fresh DB or already v1
+	}
+
+	// FK toggle must live outside the transaction.
+	if _, err := s.DB.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return err
+	}
+	commitErr := func() error {
+		tx, err := s.DB.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+			return err
+		}
+		// Split & execute so we get a useful error per statement.
+		for _, stmt := range splitSQL(migrateV1SQL) {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("v0→v1: %s: %w", firstLine(stmt), err)
+			}
+		}
+		return tx.Commit()
+	}()
+	if _, err := s.DB.Exec(`PRAGMA foreign_keys = ON`); err != nil && commitErr == nil {
+		return err
+	}
+	return commitErr
+}
+
+// splitSQL splits a multi-statement SQL blob on `;` at end-of-line, ignoring
+// blank lines and line comments. Good enough for our migration files (no
+// triggers, no quoted semicolons).
+func splitSQL(s string) []string {
+	var out []string
+	var cur strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "" || strings.HasPrefix(trim, "--") {
+			continue
+		}
+		cur.WriteString(line)
+		cur.WriteByte('\n')
+		if strings.HasSuffix(trim, ";") {
+			out = append(out, strings.TrimSpace(cur.String()))
+			cur.Reset()
+		}
+	}
+	if rest := strings.TrimSpace(cur.String()); rest != "" {
+		out = append(out, rest)
+	}
+	return out
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 func (s *Store) seedDefaults() error {
@@ -87,7 +166,6 @@ func (s *Store) seedDefaults() error {
 		{"奖金", "income", "🎁"},
 		{"投资收益", "income", "📈"},
 		{"其他收入", "income", "💵"},
-		{"转账", "transfer", "🔁"},
 	}
 	tx, err := s.DB.Begin()
 	if err != nil {
@@ -226,126 +304,6 @@ func (s *Store) DeletePerson(id int64) error {
 	return err
 }
 
-// ---------- Account ----------
-
-func (s *Store) CreateAccount(a Account) (*Account, error) {
-	if a.Currency == "" {
-		a.Currency = "CNY"
-	}
-	if err := validateOwner(s, a.OwnerKind, a.OwnerID); err != nil {
-		return nil, err
-	}
-	res, err := s.DB.Exec(`INSERT INTO account(name, type, currency, initial_balance, owner_kind, owner_id, note)
-	                       VALUES(?,?,?,?,?,?,?)`,
-		a.Name, a.Type, a.Currency, a.InitialBalance, a.OwnerKind, a.OwnerID, nullIfEmpty(a.Note))
-	if err != nil {
-		return nil, err
-	}
-	id, _ := res.LastInsertId()
-	return s.GetAccount(id)
-}
-
-func (s *Store) GetAccount(id int64) (*Account, error) {
-	var a Account
-	var note sql.NullString
-	var archived int
-	var created string
-	err := s.DB.QueryRow(`SELECT id, name, type, currency, initial_balance, owner_kind, owner_id, archived, note, created_at
-	                      FROM account WHERE id=?`, id).
-		Scan(&a.ID, &a.Name, &a.Type, &a.Currency, &a.InitialBalance, &a.OwnerKind, &a.OwnerID, &archived, &note, &created)
-	if err != nil {
-		return nil, err
-	}
-	a.Archived = archived != 0
-	a.Note = note.String
-	a.CreatedAt = parseTime(created)
-	return &a, nil
-}
-
-func (s *Store) ListAccounts(ownerKind string, ownerID int64, includeArchived bool) ([]Account, error) {
-	q := `SELECT id, name, type, currency, initial_balance, owner_kind, owner_id, archived, COALESCE(note,''), created_at
-	      FROM account WHERE 1=1`
-	args := []any{}
-	if ownerKind != "" {
-		q += ` AND owner_kind=?`
-		args = append(args, ownerKind)
-	}
-	if ownerID != 0 {
-		q += ` AND owner_id=?`
-		args = append(args, ownerID)
-	}
-	if !includeArchived {
-		q += ` AND archived=0`
-	}
-	q += ` ORDER BY id`
-	rows, err := s.DB.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Account
-	for rows.Next() {
-		var a Account
-		var archived int
-		var created string
-		if err := rows.Scan(&a.ID, &a.Name, &a.Type, &a.Currency, &a.InitialBalance,
-			&a.OwnerKind, &a.OwnerID, &archived, &a.Note, &created); err != nil {
-			return nil, err
-		}
-		a.Archived = archived != 0
-		a.CreatedAt = parseTime(created)
-		out = append(out, a)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) ArchiveAccount(id int64, archived bool) error {
-	v := 0
-	if archived {
-		v = 1
-	}
-	_, err := s.DB.Exec(`UPDATE account SET archived=? WHERE id=?`, v, id)
-	return err
-}
-
-// AccountBalance computes initial_balance + sum(incoming) - sum(outgoing).
-// Transfers count as outgoing from source, incoming to counter.
-func (s *Store) AccountBalanceOf(id int64) (int64, error) {
-	var init int64
-	if err := s.DB.QueryRow(`SELECT initial_balance FROM account WHERE id=?`, id).Scan(&init); err != nil {
-		return 0, err
-	}
-	var income, expense, transferOut, transferIn sql.NullInt64
-	err := s.DB.QueryRow(`
-		SELECT
-			COALESCE(SUM(CASE WHEN kind='income'   AND account_id=?         THEN amount END),0) AS income,
-			COALESCE(SUM(CASE WHEN kind='expense'  AND account_id=?         THEN amount END),0) AS expense,
-			COALESCE(SUM(CASE WHEN kind='transfer' AND account_id=?         THEN amount END),0) AS transfer_out,
-			COALESCE(SUM(CASE WHEN kind='transfer' AND counter_account_id=? THEN amount END),0) AS transfer_in
-		FROM txn
-	`, id, id, id, id).Scan(&income, &expense, &transferOut, &transferIn)
-	if err != nil {
-		return 0, err
-	}
-	return init + income.Int64 - expense.Int64 - transferOut.Int64 + transferIn.Int64, nil
-}
-
-func (s *Store) AccountBalances(ownerKind string, ownerID int64) ([]AccountBalance, error) {
-	accs, err := s.ListAccounts(ownerKind, ownerID, false)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]AccountBalance, 0, len(accs))
-	for _, a := range accs {
-		bal, err := s.AccountBalanceOf(a.ID)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, AccountBalance{Account: a, Balance: bal})
-	}
-	return out, nil
-}
-
 // ---------- Category ----------
 
 func (s *Store) CreateCategory(c Category) (*Category, error) {
@@ -468,21 +426,17 @@ func (s *Store) CreateTxn(t Txn) (*Txn, error) {
 	if t.Currency == "" {
 		t.Currency = "CNY"
 	}
-	if t.Kind == "transfer" && t.CounterAccountID == nil {
-		return nil, fmt.Errorf("transfer requires counter_account_id")
-	}
-	if t.Kind == "transfer" && t.CounterAccountID != nil && *t.CounterAccountID == t.AccountID {
-		return nil, fmt.Errorf("transfer source and destination must differ")
+	if t.Kind != "income" && t.Kind != "expense" {
+		return nil, fmt.Errorf("kind must be income or expense")
 	}
 	if t.OccurredAt.IsZero() {
 		t.OccurredAt = time.Now()
 	}
-	res, err := s.DB.Exec(`INSERT INTO txn(occurred_at, kind, amount, currency, account_id, counter_account_id,
+	res, err := s.DB.Exec(`INSERT INTO txn(occurred_at, kind, amount, currency,
 	                                       category_id, person_id, family_id, payee, note, tags)
-	                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+	                       VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		t.OccurredAt.Format(time.RFC3339),
-		t.Kind, t.Amount, t.Currency, t.AccountID,
-		nullableInt(t.CounterAccountID),
+		t.Kind, t.Amount, t.Currency,
 		nullableInt(t.CategoryID),
 		nullableInt(t.PersonID),
 		nullableInt(t.FamilyID),
@@ -496,20 +450,16 @@ func (s *Store) CreateTxn(t Txn) (*Txn, error) {
 
 func (s *Store) GetTxn(id int64) (*Txn, error) {
 	var t Txn
-	var counter, cat, per, fam sql.NullInt64
+	var cat, per, fam sql.NullInt64
 	var payee, note, tags sql.NullString
 	var occurred, created string
-	err := s.DB.QueryRow(`SELECT id, occurred_at, kind, amount, currency, account_id, counter_account_id,
+	err := s.DB.QueryRow(`SELECT id, occurred_at, kind, amount, currency,
 	                             category_id, person_id, family_id, payee, note, tags, created_at
 	                      FROM txn WHERE id=?`, id).
-		Scan(&t.ID, &occurred, &t.Kind, &t.Amount, &t.Currency, &t.AccountID, &counter,
+		Scan(&t.ID, &occurred, &t.Kind, &t.Amount, &t.Currency,
 			&cat, &per, &fam, &payee, &note, &tags, &created)
 	if err != nil {
 		return nil, err
-	}
-	if counter.Valid {
-		v := counter.Int64
-		t.CounterAccountID = &v
 	}
 	if cat.Valid {
 		v := cat.Int64
@@ -536,8 +486,37 @@ func (s *Store) DeleteTxn(id int64) error {
 	return err
 }
 
+// scopeClause returns a SQL fragment + args that restrict `txn` to rows
+// belonging to the scope-person's family. Empty when no scope was requested.
+//
+// A txn is in-scope when ANY of:
+//   - txn.person_id is the scope person
+//   - txn.person_id belongs to the scope person's family (any sibling)
+//   - txn.family_id matches the scope person's family
+//
+// Unscoped txns (NULL person_id AND NULL family_id) are intentionally invisible
+// to scoped readers — they have no owner to authorize against.
+func scopeClause(scopePersonID int64) (string, []any) {
+	if scopePersonID <= 0 {
+		return "", nil
+	}
+	// Three subqueries against `person` is fine; SQLite caches the plan and the
+	// table is tiny (one row per household member).
+	frag := ` AND (
+		txn.person_id = ?
+		OR txn.person_id IN (
+			SELECT p.id FROM person p
+			WHERE p.family_id IS NOT NULL
+			  AND p.family_id = (SELECT family_id FROM person WHERE id = ?)
+		)
+		OR (txn.family_id IS NOT NULL
+		    AND txn.family_id = (SELECT family_id FROM person WHERE id = ?))
+	)`
+	return frag, []any{scopePersonID, scopePersonID, scopePersonID}
+}
+
 func (s *Store) ListTxns(f TxnFilter) ([]Txn, error) {
-	q := `SELECT id, occurred_at, kind, amount, currency, account_id, counter_account_id,
+	q := `SELECT id, occurred_at, kind, amount, currency,
 	             category_id, person_id, family_id, COALESCE(payee,''), COALESCE(note,''), COALESCE(tags,''), created_at
 	      FROM txn WHERE 1=1`
 	args := []any{}
@@ -552,10 +531,6 @@ func (s *Store) ListTxns(f TxnFilter) ([]Txn, error) {
 	if f.Kind != "" {
 		q += ` AND kind=?`
 		args = append(args, f.Kind)
-	}
-	if f.AccountID != 0 {
-		q += ` AND (account_id=? OR counter_account_id=?)`
-		args = append(args, f.AccountID, f.AccountID)
 	}
 	if f.PersonID != 0 {
 		q += ` AND person_id=?`
@@ -574,6 +549,10 @@ func (s *Store) ListTxns(f TxnFilter) ([]Txn, error) {
 		like := "%" + f.Search + "%"
 		args = append(args, like, like)
 	}
+	if frag, scopeArgs := scopeClause(f.ScopePersonID); frag != "" {
+		q += frag
+		args = append(args, scopeArgs...)
+	}
 	q += ` ORDER BY occurred_at DESC, id DESC`
 	if f.Limit > 0 {
 		q += fmt.Sprintf(` LIMIT %d OFFSET %d`, f.Limit, f.Offset)
@@ -586,15 +565,11 @@ func (s *Store) ListTxns(f TxnFilter) ([]Txn, error) {
 	var out []Txn
 	for rows.Next() {
 		var t Txn
-		var counter, cat, per, fam sql.NullInt64
+		var cat, per, fam sql.NullInt64
 		var occurred, created string
-		if err := rows.Scan(&t.ID, &occurred, &t.Kind, &t.Amount, &t.Currency, &t.AccountID, &counter,
+		if err := rows.Scan(&t.ID, &occurred, &t.Kind, &t.Amount, &t.Currency,
 			&cat, &per, &fam, &t.Payee, &t.Note, &t.Tags, &created); err != nil {
 			return nil, err
-		}
-		if counter.Valid {
-			v := counter.Int64
-			t.CounterAccountID = &v
 		}
 		if cat.Valid {
 			v := cat.Int64
@@ -656,7 +631,14 @@ func (s *Store) GetBudget(id int64) (*Budget, error) {
 	return &b, nil
 }
 
-func (s *Store) ListBudgets(ownerKind string, ownerID int64) ([]Budget, error) {
+// ListBudgets returns budgets visible from the given scope.
+//
+//   - ownerKind/ownerID, when set, are honored as the legacy "filter to this
+//     exact owner" knob.
+//   - scopePersonID, when set, restricts results to budgets whose owner is
+//     either the scope person, a sibling sharing the same family, or the scope
+//     person's family.
+func (s *Store) ListBudgets(ownerKind string, ownerID, scopePersonID int64) ([]Budget, error) {
 	q := `SELECT id, name, period, amount, currency, category_id, owner_kind, owner_id,
 	             start_date, COALESCE(end_date,''), created_at FROM budget WHERE 1=1`
 	args := []any{}
@@ -667,6 +649,20 @@ func (s *Store) ListBudgets(ownerKind string, ownerID int64) ([]Budget, error) {
 	if ownerID != 0 {
 		q += ` AND owner_id=?`
 		args = append(args, ownerID)
+	}
+	if scopePersonID > 0 {
+		q += ` AND (
+			(owner_kind='person' AND owner_id IN (
+				SELECT p.id FROM person p
+				WHERE p.id = ?
+				   OR (p.family_id IS NOT NULL
+				       AND p.family_id = (SELECT family_id FROM person WHERE id = ?))
+			))
+			OR (owner_kind='family' AND owner_id = (
+				SELECT family_id FROM person WHERE id = ? AND family_id IS NOT NULL
+			))
+		)`
+		args = append(args, scopePersonID, scopePersonID, scopePersonID)
 	}
 	q += ` ORDER BY id`
 	rows, err := s.DB.Query(q, args...)
@@ -708,6 +704,11 @@ type BudgetStatus struct {
 	Until     string `json:"until"`
 }
 
+// BudgetStatusAt computes spent/remaining for a budget at the given reference
+// date. The summed txns are those owned by the budget's owner:
+//   - owner_kind='person' → txn.person_id matches.
+//   - owner_kind='family' → txn.family_id matches OR txn.person_id belongs
+//     to that family (treats family-tagged + member-tagged expenses alike).
 func (s *Store) BudgetStatusAt(b Budget, ref time.Time) (*BudgetStatus, error) {
 	since, until := periodWindow(b.Period, ref)
 	q := `SELECT COALESCE(SUM(amount),0) FROM txn
@@ -718,9 +719,16 @@ func (s *Store) BudgetStatusAt(b Budget, ref time.Time) (*BudgetStatus, error) {
 		q += ` AND category_id=?`
 		args = append(args, *b.CategoryID)
 	}
-	// Scope the budget to its owner's accounts.
-	q += ` AND account_id IN (SELECT id FROM account WHERE owner_kind=? AND owner_id=?)`
-	args = append(args, b.OwnerKind, b.OwnerID)
+	switch b.OwnerKind {
+	case "person":
+		q += ` AND person_id=?`
+		args = append(args, b.OwnerID)
+	case "family":
+		q += ` AND (family_id=? OR person_id IN (SELECT id FROM person WHERE family_id=?))`
+		args = append(args, b.OwnerID, b.OwnerID)
+	default:
+		return nil, fmt.Errorf("budget %d has unexpected owner_kind=%q", b.ID, b.OwnerKind)
+	}
 
 	var spent int64
 	if err := s.DB.QueryRow(q, args...).Scan(&spent); err != nil {
@@ -737,7 +745,7 @@ func (s *Store) BudgetStatusAt(b Budget, ref time.Time) (*BudgetStatus, error) {
 }
 
 func periodWindow(period string, ref time.Time) (string, string) {
-	y, m, d := ref.Date()
+	y, m, _ := ref.Date()
 	switch period {
 	case "weekly":
 		// ISO week: Monday..Sunday
@@ -753,7 +761,6 @@ func periodWindow(period string, ref time.Time) (string, string) {
 	default: // monthly
 		start := time.Date(y, m, 1, 0, 0, 0, 0, ref.Location())
 		end := start.AddDate(0, 1, -1)
-		_ = d
 		return start.Format("2006-01-02"), end.Format("2006-01-02")
 	}
 }
@@ -768,43 +775,17 @@ func (s *Store) Summarize(f TxnFilter) (*Summary, error) {
 	sum := &Summary{Since: f.Since, Until: f.Until, TxnCount: len(txns)}
 	byCat := map[int64]*CategoryAmount{}
 	noCat := &CategoryAmount{CategoryName: "(未分类)", Kind: "expense"}
-	byAcc := map[int64]*AccountAmount{}
 	for _, t := range txns {
 		if sum.Currency == "" {
 			sum.Currency = t.Currency
 		}
-		// per-account
-		getAcc := func(id int64) *AccountAmount {
-			if a, ok := byAcc[id]; ok {
-				return a
-			}
-			acc, _ := s.GetAccount(id)
-			name := fmt.Sprintf("account#%d", id)
-			if acc != nil {
-				name = acc.Name
-			}
-			a := &AccountAmount{AccountID: id, AccountName: name}
-			byAcc[id] = a
-			return a
-		}
 		switch t.Kind {
 		case "income":
 			sum.Income += t.Amount
-			getAcc(t.AccountID).Income += t.Amount
-			getAcc(t.AccountID).Net += t.Amount
 			addCat(byCat, noCat, t, s)
 		case "expense":
 			sum.Expense += t.Amount
-			getAcc(t.AccountID).Expense += t.Amount
-			getAcc(t.AccountID).Net -= t.Amount
 			addCat(byCat, noCat, t, s)
-		case "transfer":
-			getAcc(t.AccountID).Expense += t.Amount
-			getAcc(t.AccountID).Net -= t.Amount
-			if t.CounterAccountID != nil {
-				getAcc(*t.CounterAccountID).Income += t.Amount
-				getAcc(*t.CounterAccountID).Net += t.Amount
-			}
 		}
 	}
 	sum.Net = sum.Income - sum.Expense
@@ -813,9 +794,6 @@ func (s *Store) Summarize(f TxnFilter) (*Summary, error) {
 	}
 	if noCat.Amount > 0 {
 		sum.ByCategory = append(sum.ByCategory, *noCat)
-	}
-	for _, a := range byAcc {
-		sum.ByAccount = append(sum.ByAccount, *a)
 	}
 	return sum, nil
 }

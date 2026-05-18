@@ -44,7 +44,7 @@ type client struct {
 func newClient(t *testing.T, dbPath string) *client {
 	t.Helper()
 	cmd := exec.Command(mcpBin)
-	cmd.Env = append(os.Environ(), "SUANPAN_DB="+dbPath)
+	cmd.Env = append(os.Environ(), "SUANPAN_DB="+dbPath, "SUANPAN_AS_PERSON=")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -162,17 +162,23 @@ func TestMCP_InitializeAndToolList(t *testing.T) {
 	if err := json.Unmarshal(res.Result, &tl); err != nil {
 		t.Fatal(err)
 	}
-	if len(tl.Tools) != 24 {
-		t.Errorf("tools=%d, want 24", len(tl.Tools))
+	if len(tl.Tools) != 19 {
+		t.Errorf("tools=%d, want 19", len(tl.Tools))
 	}
 	// Spot-check a few must-have tools.
 	names := map[string]bool{}
 	for _, tool := range tl.Tools {
 		names[tool["name"].(string)] = true
 	}
-	for _, want := range []string{"add_expense", "add_income", "add_transfer", "summarize", "account_balances", "budget_status"} {
+	for _, want := range []string{"add_expense", "add_income", "summarize", "budget_status", "list_transactions"} {
 		if !names[want] {
 			t.Errorf("missing tool %s", want)
+		}
+	}
+	// Verify removed tools are gone.
+	for _, gone := range []string{"create_account", "list_accounts", "archive_account", "account_balances", "add_transfer"} {
+		if names[gone] {
+			t.Errorf("removed tool still present: %s", gone)
 		}
 	}
 }
@@ -185,10 +191,6 @@ func TestMCP_AddExpenseAndSummarize(t *testing.T) {
 	// Scenario setup.
 	c.callTool("create_family", map[string]any{"name": "家", "currency": "CNY"}, nil)
 	c.callTool("create_person", map[string]any{"name": "Z", "family_id": 1}, nil)
-	c.callTool("create_account", map[string]any{
-		"name": "A", "type": "cash", "currency": "CNY",
-		"initial_balance": "100.00", "owner_kind": "person", "owner_id": 1,
-	}, nil)
 
 	var txn struct {
 		ID     int64  `json:"id"`
@@ -197,7 +199,7 @@ func TestMCP_AddExpenseAndSummarize(t *testing.T) {
 	}
 	c.callTool("add_expense", map[string]any{
 		"amount":        "28.50",
-		"account_id":    1,
+		"person_id":     1,
 		"category_name": "餐饮",
 		"date":          "2026-04-15",
 	}, &txn)
@@ -211,7 +213,7 @@ func TestMCP_AddExpenseAndSummarize(t *testing.T) {
 	// add_income with numeric amount (float64 in JSON) — moneyArg must handle it.
 	c.callTool("add_income", map[string]any{
 		"amount":        100.5,
-		"account_id":    1,
+		"person_id":     1,
 		"category_name": "工资",
 		"date":          "2026-04-05",
 	}, nil)
@@ -222,7 +224,11 @@ func TestMCP_AddExpenseAndSummarize(t *testing.T) {
 		Net      int64 `json:"net"`
 		TxnCount int   `json:"txn_count"`
 	}
-	c.callTool("summarize", map[string]any{"since": "2026-04-01", "until": "2026-04-30"}, &sum)
+	c.callTool("summarize", map[string]any{
+		"as_person_id": 1,
+		"since":        "2026-04-01",
+		"until":        "2026-04-30",
+	}, &sum)
 	if sum.Expense != 2850 {
 		t.Errorf("expense=%d, want 2850", sum.Expense)
 	}
@@ -235,14 +241,30 @@ func TestMCP_AddExpenseAndSummarize(t *testing.T) {
 	if sum.TxnCount != 2 {
 		t.Errorf("txn_count=%d", sum.TxnCount)
 	}
+}
 
-	// account_balances sanity: 10000 (init) + 10050 (income) - 2850 (expense) = 17200
-	var bals []struct {
-		Balance int64 `json:"balance"`
-	}
-	c.callTool("account_balances", map[string]any{"owner_kind": "person", "owner_id": 1}, &bals)
-	if len(bals) != 1 || bals[0].Balance != 17200 {
-		t.Errorf("balances=%+v, want one with 17200", bals)
+// TestMCP_ScopeEnforced verifies that summarize/list_transactions refuse to run
+// without an as_person_id (or $SUANPAN_AS_PERSON).
+func TestMCP_ScopeEnforced(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	c := newClient(t, db)
+	c.call("initialize", map[string]any{})
+
+	res := c.call("tools/call", map[string]any{
+		"name":      "summarize",
+		"arguments": map[string]any{"since": "2026-04-01", "until": "2026-04-30"},
+	})
+	if res.Error == nil {
+		// MCP wraps tool errors into isError content rather than rpc error in
+		// some paths — accept either shape.
+		var wrap struct {
+			Content []struct{ Text string }
+			IsError bool `json:"isError"`
+		}
+		json.Unmarshal(res.Result, &wrap)
+		if !wrap.IsError {
+			t.Errorf("expected error when as_person_id missing; got result=%s", res.Result)
+		}
 	}
 }
 

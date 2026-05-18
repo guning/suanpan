@@ -142,21 +142,18 @@ func TestMCP_HTTP_Basic(t *testing.T) {
 		Tools []map[string]any `json:"tools"`
 	}
 	json.Unmarshal(r.Result, &tl)
-	if len(tl.Tools) != 24 {
-		t.Errorf("tools=%d, want 24", len(tl.Tools))
+	if len(tl.Tools) != 19 {
+		t.Errorf("tools=%d, want 19", len(tl.Tools))
 	}
 
 	// basic scenario
 	httpCallTool(t, addr, "create_person", map[string]any{"name": "u"}, 3, nil, nil)
-	httpCallTool(t, addr, "create_account", map[string]any{
-		"name": "A", "type": "cash", "owner_kind": "person", "owner_id": 1,
-	}, 4, nil, nil)
 	var txn struct {
 		Amount int64 `json:"amount"`
 	}
 	httpCallTool(t, addr, "add_expense", map[string]any{
-		"amount": "12.34", "account_id": 1, "date": "2026-04-15",
-	}, 5, &txn, nil)
+		"amount": "12.34", "person_id": 1, "date": "2026-04-15",
+	}, 4, &txn, nil)
 	if txn.Amount != 1234 {
 		t.Errorf("amount=%d, want 1234", txn.Amount)
 	}
@@ -195,17 +192,11 @@ func TestMCP_HTTP_ConcurrentClients(t *testing.T) {
 				return
 			}
 
-			var a struct{ ID int64 }
-			httpCallTool(t, addr, "create_account", map[string]any{
-				"name": fmt.Sprintf("acct%d", i), "type": "cash",
-				"owner_kind": "person", "owner_id": p.ID,
-			}, nextID(), &a, nil)
-
 			for j := 0; j < txnsPerClient; j++ {
 				httpCallTool(t, addr, "add_expense", map[string]any{
-					"amount":     fmt.Sprintf("%d.%02d", j+1, j),
-					"account_id": a.ID,
-					"date":       "2026-04-15",
+					"amount":    fmt.Sprintf("%d.%02d", j+1, j),
+					"person_id": p.ID,
+					"date":      "2026-04-15",
 				}, nextID(), nil, nil)
 			}
 		}()
@@ -216,12 +207,18 @@ func TestMCP_HTTP_ConcurrentClients(t *testing.T) {
 		t.Error(err)
 	}
 
-	// All writes should be durable and queryable.
-	var txns []map[string]any
-	httpCallTool(t, addr, "list_transactions", map[string]any{
-		"since": "2026-04-01", "until": "2026-04-30", "limit": 10000,
-	}, nextID(), &txns, nil)
-	if got, want := len(txns), clients*txnsPerClient; got != want {
+	// list_transactions has no global "show all" — we'd have to call it once per
+	// person. Easier: sum txns visible to each person and check totals add up.
+	got := 0
+	for i := 0; i < clients; i++ {
+		var txns []map[string]any
+		httpCallTool(t, addr, "list_transactions", map[string]any{
+			"as_person_id": i + 1,
+			"since":        "2026-04-01", "until": "2026-04-30", "limit": 10000,
+		}, nextID(), &txns, nil)
+		got += len(txns)
+	}
+	if want := clients * txnsPerClient; got != want {
 		t.Errorf("persisted txns=%d, want %d", got, want)
 	}
 }

@@ -49,6 +49,9 @@ func runCLI(t *testing.T, dbPath string, args ...string) cliResult {
 	t.Helper()
 	cmd := exec.Command(suanpanBin, args...)
 	cmd.Env = append(os.Environ(), "SUANPAN_DB="+dbPath)
+	// Tests must set SUANPAN_AS_PERSON explicitly via runCLI calls that pass
+	// -as-person, or the read commands will refuse. Wipe any inherited value.
+	cmd.Env = append(cmd.Env, "SUANPAN_AS_PERSON=")
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -81,29 +84,24 @@ func TestCLI_EndToEnd(t *testing.T) {
 
 	mustRun(t, db, "family", "add", "-name", "张家")
 	mustRun(t, db, "person", "add", "-name", "张三", "-family", "1")
-	mustRun(t, db, "account", "add", "-name", "招行", "-type", "bank", "-owner", "person:1", "-initial", "5000")
-	mustRun(t, db, "account", "add", "-name", "现金", "-type", "cash", "-owner", "person:1")
-	mustRun(t, db, "txn", "add", "-amount", "28.50", "-account", "1", "-kind", "expense", "-category-name", "餐饮", "-person", "1")
-	mustRun(t, db, "txn", "add", "-amount", "12000", "-account", "1", "-kind", "income", "-category-name", "工资", "-person", "1")
-	mustRun(t, db, "txn", "transfer", "-from", "1", "-to", "2", "-amount", "100")
+	mustRun(t, db, "txn", "add", "-amount", "28.50", "-kind", "expense", "-category-name", "餐饮", "-person", "1")
+	mustRun(t, db, "txn", "add", "-amount", "12000", "-kind", "income", "-category-name", "工资", "-person", "1")
 
-	// Balances via JSON. Expected:
-	//   acct 1: 500000 + 1200000 - 2850 - 10000 = 1687150
-	//   acct 2:                    + 10000      =   10000
-	r = mustRun(t, db, "account", "balance", "-owner", "person:1", "-json")
-	if !strings.Contains(r.stdout, `"balance": 1687150`) {
-		t.Errorf("expected balance 1687150 in %q", r.stdout)
-	}
-	if !strings.Contains(r.stdout, `"balance": 10000`) {
-		t.Errorf("expected balance 10000 in %q", r.stdout)
-	}
-
-	// Report for a wide window.
-	r = mustRun(t, db, "report", "-since", "2026-01-01", "-until", "2026-12-31")
+	// Report for a wide window — scoped to person 1.
+	r = mustRun(t, db, "report", "-as-person", "1", "-since", "2026-01-01", "-until", "2026-12-31")
 	for _, want := range []string{"Income", "Expense", "12000.00", "28.50"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("report missing %q: %s", want, r.stdout)
 		}
+	}
+
+	// Verify txn list also respects scope.
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-01-01", "-limit", "10", "-json")
+	if !strings.Contains(r.stdout, `"amount": 2850`) {
+		t.Errorf("expected 2850 expense in scoped list: %s", r.stdout)
+	}
+	if !strings.Contains(r.stdout, `"amount": 1200000`) {
+		t.Errorf("expected 1200000 income in scoped list: %s", r.stdout)
 	}
 }
 
@@ -111,11 +109,10 @@ func TestCLI_BudgetStatus(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "s.db")
 	mustRun(t, db, "init")
 	mustRun(t, db, "person", "add", "-name", "u")
-	mustRun(t, db, "account", "add", "-name", "A", "-type", "cash", "-owner", "person:1")
-	mustRun(t, db, "txn", "add", "-amount", "300", "-account", "1", "-kind", "expense", "-category-name", "餐饮", "-date", "2026-04-10")
+	mustRun(t, db, "txn", "add", "-amount", "300", "-kind", "expense", "-category-name", "餐饮", "-person", "1", "-date", "2026-04-10")
 	mustRun(t, db, "budget", "add", "-name", "月度", "-period", "monthly", "-amount", "1000", "-owner", "person:1", "-start", "2026-01-01")
 
-	r := mustRun(t, db, "budget", "status", "-owner", "person:1", "-date", "2026-04-15", "-json")
+	r := mustRun(t, db, "budget", "status", "-as-person", "1", "-date", "2026-04-15", "-json")
 	if !strings.Contains(r.stdout, `"spent": 30000`) {
 		t.Errorf("spent not 30000: %s", r.stdout)
 	}
@@ -128,14 +125,67 @@ func TestCLI_RejectsInvalidAmount(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "s.db")
 	mustRun(t, db, "init")
 	mustRun(t, db, "person", "add", "-name", "u")
-	mustRun(t, db, "account", "add", "-name", "A", "-type", "cash", "-owner", "person:1")
 
-	r := runCLI(t, db, "txn", "add", "-amount", "0", "-account", "1", "-kind", "expense")
+	r := runCLI(t, db, "txn", "add", "-amount", "0", "-kind", "expense", "-person", "1")
 	if r.code == 0 {
 		t.Errorf("expected non-zero exit for zero amount, got stdout=%q", r.stdout)
 	}
 	if !strings.Contains(r.stderr, "positive") {
 		t.Errorf("stderr should complain about positive amount: %q", r.stderr)
+	}
+}
+
+// TestCLI_ReportRequiresScope verifies that scoped reads error out when
+// neither -as-person nor $SUANPAN_AS_PERSON is provided.
+func TestCLI_ReportRequiresScope(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	r := runCLI(t, db, "report", "-since", "2026-01-01", "-until", "2026-12-31")
+	if r.code == 0 {
+		t.Errorf("expected non-zero exit when scope missing; stdout=%q stderr=%q", r.stdout, r.stderr)
+	}
+	if !strings.Contains(r.stderr, "as-person") {
+		t.Errorf("stderr should mention -as-person: %q", r.stderr)
+	}
+}
+
+// TestCLI_ScopeHidesOtherFamily verifies the security gate end-to-end: alice
+// in family A cannot see carl's (family B) spending.
+func TestCLI_ScopeHidesOtherFamily(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	mustRun(t, db, "family", "add", "-name", "A家")
+	mustRun(t, db, "family", "add", "-name", "B家")
+	mustRun(t, db, "person", "add", "-name", "alice", "-family", "1")
+	mustRun(t, db, "person", "add", "-name", "carl", "-family", "2")
+	mustRun(t, db, "txn", "add", "-amount", "11.11", "-kind", "expense", "-person", "1", "-date", "2026-04-10")
+	mustRun(t, db, "txn", "add", "-amount", "99.99", "-kind", "expense", "-person", "2", "-date", "2026-04-10")
+
+	// Alice's report should see her 11.11 but NOT carl's 99.99.
+	r := mustRun(t, db, "report", "-as-person", "1", "-since", "2026-04-01", "-until", "2026-04-30", "-json")
+	if !strings.Contains(r.stdout, `"expense": 1111`) {
+		t.Errorf("alice should see her expense (1111 minor units): %s", r.stdout)
+	}
+	if strings.Contains(r.stdout, "9999") {
+		t.Errorf("alice should NOT see carl's expense (9999): %s", r.stdout)
+	}
+
+	// `txn list` must apply the same scope. JSON output makes the assertion
+	// stable: alice sees only her 1111, carl sees only his 9999.
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-json")
+	if !strings.Contains(r.stdout, `"amount": 1111`) {
+		t.Errorf("alice's txn list should include 1111: %s", r.stdout)
+	}
+	if strings.Contains(r.stdout, `"amount": 9999`) {
+		t.Errorf("alice's txn list should NOT leak carl's 9999: %s", r.stdout)
+	}
+
+	r = mustRun(t, db, "txn", "list", "-as-person", "2", "-since", "2026-04-01", "-json")
+	if !strings.Contains(r.stdout, `"amount": 9999`) {
+		t.Errorf("carl's txn list should include 9999: %s", r.stdout)
+	}
+	if strings.Contains(r.stdout, `"amount": 1111`) {
+		t.Errorf("carl's txn list should NOT leak alice's 1111: %s", r.stdout)
 	}
 }
 
@@ -194,13 +244,53 @@ func TestCLI_InstallSkill_User(t *testing.T) {
 		t.Errorf("stdout should print the mcp add command: %q", r.stdout)
 	}
 
-	// Second run without -force should skip (and still exit 0).
+	// Second run without -force at the same version should skip (and still
+	// exit 0). The message includes the version so users see what's installed.
 	r2 := runCLIWithHome(t, home, db, "install-skill")
 	if r2.code != 0 {
 		t.Errorf("second run exit=%d", r2.code)
 	}
-	if !strings.Contains(r2.stderr, "already exists") {
-		t.Errorf("expected 'already exists' warning, got: %q", r2.stderr)
+	if !strings.Contains(r2.stderr, "already at v") {
+		t.Errorf("expected 'already at v' warning, got: %q", r2.stderr)
+	}
+}
+
+// TestCLI_InstallSkill_AutoUpgrade verifies the version-bump contract: an
+// installed SKILL.md older than the bundled one is silently upgraded without
+// requiring -force. Covers the v0-style pre-versioning install (treated as v0)
+// upgrading to whatever the embedded binary ships.
+func TestCLI_InstallSkill_AutoUpgrade(t *testing.T) {
+	home := t.TempDir()
+	db := filepath.Join(t.TempDir(), "s.db")
+	skillFile := filepath.Join(home, ".claude", "skills", "accounting", "SKILL.md")
+
+	// Plant a stale skill — no `version:` field at all, so the parser reads it
+	// as v0 (older than anything we ship now).
+	if err := os.MkdirAll(filepath.Dir(skillFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := "---\nname: accounting\ndescription: old\n---\nstale body\n"
+	if err := os.WriteFile(skillFile, []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := runCLIWithHome(t, home, db, "install-skill")
+	if r.code != 0 {
+		t.Fatalf("exit=%d stderr=%s", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "upgraded skill v0") {
+		t.Errorf("expected 'upgraded skill v0' message, got stdout=%q stderr=%q", r.stdout, r.stderr)
+	}
+
+	body, err := os.ReadFile(skillFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "stale body") {
+		t.Errorf("stale content not replaced: %s", body)
+	}
+	if !strings.Contains(string(body), "version:") {
+		t.Errorf("upgraded skill should have a version line: %s", body)
 	}
 }
 

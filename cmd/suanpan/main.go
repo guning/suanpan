@@ -46,7 +46,6 @@ func main() {
 		"init":          cmdInit,
 		"family":        cmdFamily,
 		"person":        cmdPerson,
-		"account":       cmdAccount,
 		"category":      cmdCategory,
 		"txn":           cmdTxn,
 		"budget":        cmdBudget,
@@ -76,9 +75,8 @@ COMMANDS:
   init                     Create schema and seed default categories
   family add|list|rm       Manage families
   person add|list|rm       Manage persons
-  account add|list|archive|balance
   category add|list|rm     Manage categories
-  txn add|transfer|list|rm Manage transactions
+  txn add|list|rm          Manage transactions
   budget add|list|status|rm
   report                   Summarize income/expense for a period
   install-skill            Install the Claude Code skill + print MCP setup
@@ -86,14 +84,18 @@ COMMANDS:
 GLOBAL FLAGS:
   -db PATH   SQLite DB path (env $SUANPAN_DB, default ~/.suanpan/suanpan.db)
 
+Read commands (report, txn list, budget list, budget status) require a
+caller identity for family-scoping: pass -as-person <id>, or export
+$SUANPAN_AS_PERSON. Results are restricted to that person, their family
+siblings, and the family ledger; other families' data is hidden.
+
 Examples:
   suanpan init
   suanpan family add -name "张家" -currency CNY
   suanpan person add -name "张三" -family 1
-  suanpan account add -name 招行储蓄 -type bank -owner person:1 -initial 5000
-  suanpan txn add -amount 23.5 -account 1 -kind expense -category-name 餐饮 -person 1
-  suanpan txn list -since 2026-04-01
-  suanpan report -since 2026-04-01 -until 2026-04-30
+  suanpan txn add -amount 23.5 -kind expense -category-name 餐饮 -person 1
+  suanpan txn list -as-person 1 -since 2026-04-01
+  suanpan report -as-person 1 -since 2026-04-01 -until 2026-04-30
 `)
 }
 
@@ -121,6 +123,26 @@ func parseOwner(s string) (string, int64, error) {
 		return "", 0, fmt.Errorf("owner id: %w", err)
 	}
 	return kind, id, nil
+}
+
+// resolveScopePerson picks the caller identity for scoped reads, preferring
+// the explicit -as-person flag and falling back to $SUANPAN_AS_PERSON.
+// Returns an error if neither is set — scoped reads MUST identify a caller.
+func resolveScopePerson(flagVal int64) (int64, error) {
+	if flagVal > 0 {
+		return flagVal, nil
+	}
+	if env := os.Getenv("SUANPAN_AS_PERSON"); env != "" {
+		v, err := strconv.ParseInt(env, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("$SUANPAN_AS_PERSON=%q: %w", env, err)
+		}
+		if v <= 0 {
+			return 0, fmt.Errorf("$SUANPAN_AS_PERSON must be a positive person id")
+		}
+		return v, nil
+	}
+	return 0, errors.New("-as-person <id> is required (or set $SUANPAN_AS_PERSON); scoped reads only return your family's data")
 }
 
 func emitJSON(v any) error {
@@ -323,135 +345,6 @@ func cmdPerson(args []string) error {
 	return nil
 }
 
-// ---- account ----
-
-func cmdAccount(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: suanpan account <add|list|archive|balance> ...")
-	}
-	sub, rest := args[0], args[1:]
-	switch sub {
-	case "add":
-		fs := flag.NewFlagSet("account add", flag.ExitOnError)
-		name := fs.String("name", "", "account name (required)")
-		typ := fs.String("type", "bank", "type: cash|bank|credit|investment|virtual")
-		currency := fs.String("currency", "CNY", "currency")
-		initial := fs.String("initial", "0", "initial balance (decimal, e.g. 100.00)")
-		ownerStr := fs.String("owner", "", "owner kind:id (person:1 or family:2) (required)")
-		note := fs.String("note", "", "note")
-		asJSON := fs.Bool("json", false, "output JSON")
-		fs.Parse(rest)
-		if *name == "" || *ownerStr == "" {
-			return errors.New("-name and -owner are required")
-		}
-		kind, id, err := parseOwner(*ownerStr)
-		if err != nil {
-			return err
-		}
-		init, err := store.ParseAmount(*initial)
-		if err != nil {
-			return err
-		}
-		s, err := openStore()
-		if err != nil {
-			return err
-		}
-		defer s.Close()
-		a, err := s.CreateAccount(store.Account{
-			Name: *name, Type: *typ, Currency: *currency,
-			InitialBalance: init, OwnerKind: kind, OwnerID: id, Note: *note,
-		})
-		if err != nil {
-			return err
-		}
-		if *asJSON {
-			return emitJSON(a)
-		}
-		fmt.Printf("account #%d %s (%s %s, %s:%d) initial=%s %s\n",
-			a.ID, a.Name, a.Type, a.Currency, a.OwnerKind, a.OwnerID,
-			store.FormatAmount(a.InitialBalance), a.Currency)
-	case "list":
-		fs := flag.NewFlagSet("account list", flag.ExitOnError)
-		ownerStr := fs.String("owner", "", "filter by owner (person:1)")
-		archived := fs.Bool("archived", false, "include archived")
-		asJSON := fs.Bool("json", false, "output JSON")
-		fs.Parse(rest)
-		kind, id, err := parseOwner(*ownerStr)
-		if err != nil {
-			return err
-		}
-		s, err := openStore()
-		if err != nil {
-			return err
-		}
-		defer s.Close()
-		accs, err := s.ListAccounts(kind, id, *archived)
-		if err != nil {
-			return err
-		}
-		if *asJSON {
-			return emitJSON(accs)
-		}
-		w := tw()
-		fmt.Fprintln(w, "ID\tNAME\tTYPE\tCCY\tOWNER\tINITIAL\tARCH")
-		for _, a := range accs {
-			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s:%d\t%s\t%v\n",
-				a.ID, a.Name, a.Type, a.Currency, a.OwnerKind, a.OwnerID,
-				store.FormatAmount(a.InitialBalance), a.Archived)
-		}
-		w.Flush()
-	case "archive":
-		fs := flag.NewFlagSet("account archive", flag.ExitOnError)
-		id := fs.Int64("id", 0, "account id")
-		off := fs.Bool("off", false, "unarchive instead of archive")
-		fs.Parse(rest)
-		if *id == 0 {
-			return errors.New("-id is required")
-		}
-		s, err := openStore()
-		if err != nil {
-			return err
-		}
-		defer s.Close()
-		return s.ArchiveAccount(*id, !*off)
-	case "balance":
-		fs := flag.NewFlagSet("account balance", flag.ExitOnError)
-		ownerStr := fs.String("owner", "", "filter by owner (person:1)")
-		asJSON := fs.Bool("json", false, "output JSON")
-		fs.Parse(rest)
-		kind, id, err := parseOwner(*ownerStr)
-		if err != nil {
-			return err
-		}
-		s, err := openStore()
-		if err != nil {
-			return err
-		}
-		defer s.Close()
-		bals, err := s.AccountBalances(kind, id)
-		if err != nil {
-			return err
-		}
-		if *asJSON {
-			return emitJSON(bals)
-		}
-		var total int64
-		w := tw()
-		fmt.Fprintln(w, "ID\tNAME\tTYPE\tCCY\tOWNER\tBALANCE")
-		for _, b := range bals {
-			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s:%d\t%s\n",
-				b.Account.ID, b.Account.Name, b.Account.Type, b.Account.Currency,
-				b.Account.OwnerKind, b.Account.OwnerID, store.FormatAmount(b.Balance))
-			total += b.Balance
-		}
-		fmt.Fprintf(w, "\t\t\t\tTOTAL\t%s\n", store.FormatAmount(total))
-		w.Flush()
-	default:
-		return fmt.Errorf("unknown account subcommand: %s", sub)
-	}
-	return nil
-}
-
 // ---- category ----
 
 func cmdCategory(args []string) error {
@@ -463,7 +356,7 @@ func cmdCategory(args []string) error {
 	case "add":
 		fs := flag.NewFlagSet("category add", flag.ExitOnError)
 		name := fs.String("name", "", "category name (required)")
-		kind := fs.String("kind", "expense", "kind: income|expense|transfer")
+		kind := fs.String("kind", "expense", "kind: income|expense")
 		parent := fs.Int64("parent", 0, "parent category id")
 		ownerStr := fs.String("owner", "", "owner kind:id (optional, blank = global)")
 		icon := fs.String("icon", "", "emoji/icon")
@@ -557,7 +450,7 @@ func cmdCategory(args []string) error {
 
 func cmdTxn(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: suanpan txn <add|transfer|list|rm> ...")
+		return errors.New("usage: suanpan txn <add|list|rm> ...")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -565,7 +458,6 @@ func cmdTxn(args []string) error {
 		fs := flag.NewFlagSet("txn add", flag.ExitOnError)
 		amount := fs.String("amount", "", "amount decimal (required)")
 		kind := fs.String("kind", "expense", "income|expense")
-		account := fs.Int64("account", 0, "account id (required)")
 		category := fs.Int64("category", 0, "category id")
 		categoryName := fs.String("category-name", "", "category name (resolved to id)")
 		person := fs.Int64("person", 0, "person id")
@@ -577,11 +469,14 @@ func cmdTxn(args []string) error {
 		currency := fs.String("currency", "CNY", "currency")
 		asJSON := fs.Bool("json", false, "output JSON")
 		fs.Parse(rest)
-		if *amount == "" || *account == 0 {
-			return errors.New("-amount and -account are required")
+		if *amount == "" {
+			return errors.New("-amount is required")
 		}
 		if *kind != "income" && *kind != "expense" {
-			return errors.New("-kind must be income or expense (use `txn transfer` for transfers)")
+			return errors.New("-kind must be income or expense")
+		}
+		if *person == 0 && *family == 0 {
+			return errors.New("-person <id> or -family <id> is required (every txn must have an owner)")
 		}
 		amt, err := store.ParseAmount(*amount)
 		if err != nil {
@@ -621,7 +516,7 @@ func cmdTxn(args []string) error {
 		}
 		t, err := s.CreateTxn(store.Txn{
 			OccurredAt: when, Kind: *kind, Amount: amt, Currency: *currency,
-			AccountID: *account, CategoryID: catID, PersonID: perID, FamilyID: famID,
+			CategoryID: catID, PersonID: perID, FamilyID: famID,
 			Payee: *payee, Note: *note, Tags: *tags,
 		})
 		if err != nil {
@@ -632,50 +527,12 @@ func cmdTxn(args []string) error {
 		}
 		fmt.Printf("txn #%d %s %s %s on %s\n", t.ID, t.Kind, store.FormatAmount(t.Amount), t.Currency,
 			t.OccurredAt.Format("2006-01-02"))
-	case "transfer":
-		fs := flag.NewFlagSet("txn transfer", flag.ExitOnError)
-		amount := fs.String("amount", "", "amount decimal (required)")
-		from := fs.Int64("from", 0, "source account id")
-		to := fs.Int64("to", 0, "destination account id")
-		dateStr := fs.String("date", "", "YYYY-MM-DD")
-		note := fs.String("note", "", "note")
-		currency := fs.String("currency", "CNY", "currency")
-		asJSON := fs.Bool("json", false, "output JSON")
-		fs.Parse(rest)
-		if *amount == "" || *from == 0 || *to == 0 {
-			return errors.New("-amount, -from, -to are required")
-		}
-		amt, err := store.ParseAmount(*amount)
-		if err != nil {
-			return err
-		}
-		when, err := parseDate(*dateStr)
-		if err != nil {
-			return err
-		}
-		s, err := openStore()
-		if err != nil {
-			return err
-		}
-		defer s.Close()
-		to64 := *to
-		t, err := s.CreateTxn(store.Txn{
-			OccurredAt: when, Kind: "transfer", Amount: amt, Currency: *currency,
-			AccountID: *from, CounterAccountID: &to64, Note: *note,
-		})
-		if err != nil {
-			return err
-		}
-		if *asJSON {
-			return emitJSON(t)
-		}
-		fmt.Printf("transfer #%d %s %s: account %d → %d\n", t.ID, store.FormatAmount(t.Amount), t.Currency, *from, *to)
 	case "list":
 		fs := flag.NewFlagSet("txn list", flag.ExitOnError)
+		asPerson := fs.Int64("as-person", 0, "caller identity for family scope (or $SUANPAN_AS_PERSON)")
 		since := fs.String("since", "", "YYYY-MM-DD")
 		until := fs.String("until", "", "YYYY-MM-DD")
-		kind := fs.String("kind", "", "income|expense|transfer")
-		account := fs.Int64("account", 0, "account id")
+		kind := fs.String("kind", "", "income|expense")
 		person := fs.Int64("person", 0, "person id")
 		family := fs.Int64("family", 0, "family id")
 		category := fs.Int64("category", 0, "category id")
@@ -683,6 +540,10 @@ func cmdTxn(args []string) error {
 		limit := fs.Int("limit", 50, "limit")
 		asJSON := fs.Bool("json", false, "output JSON")
 		fs.Parse(rest)
+		scope, err := resolveScopePerson(*asPerson)
+		if err != nil {
+			return err
+		}
 		s, err := openStore()
 		if err != nil {
 			return err
@@ -690,8 +551,8 @@ func cmdTxn(args []string) error {
 		defer s.Close()
 		txns, err := s.ListTxns(store.TxnFilter{
 			Since: *since, Until: *until, Kind: *kind,
-			AccountID: *account, PersonID: *person, FamilyID: *family, CategoryID: *category,
-			Search: *search, Limit: *limit,
+			PersonID: *person, FamilyID: *family, CategoryID: *category,
+			Search: *search, Limit: *limit, ScopePersonID: scope,
 		})
 		if err != nil {
 			return err
@@ -700,7 +561,7 @@ func cmdTxn(args []string) error {
 			return emitJSON(txns)
 		}
 		w := tw()
-		fmt.Fprintln(w, "ID\tDATE\tKIND\tAMOUNT\tCCY\tACCT\tCAT\tPER\tPAYEE\tNOTE")
+		fmt.Fprintln(w, "ID\tDATE\tKIND\tAMOUNT\tCCY\tCAT\tPER\tPAYEE\tNOTE")
 		for _, t := range txns {
 			cat := "-"
 			if t.CategoryID != nil {
@@ -710,9 +571,9 @@ func cmdTxn(args []string) error {
 			if t.PersonID != nil {
 				per = strconv.FormatInt(*t.PersonID, 10)
 			}
-			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				t.ID, t.OccurredAt.Format("2006-01-02"), t.Kind,
-				store.FormatAmount(t.Amount), t.Currency, t.AccountID,
+				store.FormatAmount(t.Amount), t.Currency,
 				cat, per, t.Payee, truncate(t.Note, 20))
 		}
 		w.Flush()
@@ -788,9 +649,14 @@ func cmdBudget(args []string) error {
 		fmt.Printf("budget #%d %s (%s %s %s)\n", b.ID, b.Name, b.Period, store.FormatAmount(b.Amount), b.Currency)
 	case "list":
 		fs := flag.NewFlagSet("budget list", flag.ExitOnError)
-		ownerStr := fs.String("owner", "", "filter by owner (kind:id)")
+		asPerson := fs.Int64("as-person", 0, "caller identity for family scope (or $SUANPAN_AS_PERSON)")
+		ownerStr := fs.String("owner", "", "further narrow by owner (kind:id)")
 		asJSON := fs.Bool("json", false, "output JSON")
 		fs.Parse(rest)
+		scope, err := resolveScopePerson(*asPerson)
+		if err != nil {
+			return err
+		}
 		kind, id, err := parseOwner(*ownerStr)
 		if err != nil {
 			return err
@@ -800,7 +666,7 @@ func cmdBudget(args []string) error {
 			return err
 		}
 		defer s.Close()
-		bs, err := s.ListBudgets(kind, id)
+		bs, err := s.ListBudgets(kind, id, scope)
 		if err != nil {
 			return err
 		}
@@ -821,10 +687,15 @@ func cmdBudget(args []string) error {
 		w.Flush()
 	case "status":
 		fs := flag.NewFlagSet("budget status", flag.ExitOnError)
-		ownerStr := fs.String("owner", "", "filter by owner (kind:id)")
+		asPerson := fs.Int64("as-person", 0, "caller identity for family scope (or $SUANPAN_AS_PERSON)")
+		ownerStr := fs.String("owner", "", "further narrow by owner (kind:id)")
 		dateStr := fs.String("date", "", "reference date (YYYY-MM-DD), default today")
 		asJSON := fs.Bool("json", false, "output JSON")
 		fs.Parse(rest)
+		scope, err := resolveScopePerson(*asPerson)
+		if err != nil {
+			return err
+		}
 		kind, id, err := parseOwner(*ownerStr)
 		if err != nil {
 			return err
@@ -841,7 +712,7 @@ func cmdBudget(args []string) error {
 			return err
 		}
 		defer s.Close()
-		bs, err := s.ListBudgets(kind, id)
+		bs, err := s.ListBudgets(kind, id, scope)
 		if err != nil {
 			return err
 		}
@@ -889,13 +760,18 @@ func cmdBudget(args []string) error {
 
 func cmdReport(args []string) error {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
+	asPerson := fs.Int64("as-person", 0, "caller identity for family scope (or $SUANPAN_AS_PERSON)")
 	since := fs.String("since", "", "YYYY-MM-DD")
 	until := fs.String("until", "", "YYYY-MM-DD")
-	person := fs.Int64("person", 0, "filter by person id")
-	family := fs.Int64("family", 0, "filter by family id")
-	account := fs.Int64("account", 0, "filter by account id")
+	person := fs.Int64("person", 0, "further narrow by person id")
+	family := fs.Int64("family", 0, "further narrow by family id")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
+
+	scope, err := resolveScopePerson(*asPerson)
+	if err != nil {
+		return err
+	}
 
 	// Default to current month if neither provided.
 	if *since == "" && *until == "" {
@@ -912,7 +788,8 @@ func cmdReport(args []string) error {
 	defer s.Close()
 	sum, err := s.Summarize(store.TxnFilter{
 		Since: *since, Until: *until,
-		PersonID: *person, FamilyID: *family, AccountID: *account,
+		PersonID: *person, FamilyID: *family,
+		ScopePersonID: scope,
 	})
 	if err != nil {
 		return err
@@ -930,16 +807,6 @@ func cmdReport(args []string) error {
 		fmt.Fprintln(w, "  KIND\tCATEGORY\tAMOUNT")
 		for _, c := range sum.ByCategory {
 			fmt.Fprintf(w, "  %s\t%s\t%s\n", c.Kind, c.CategoryName, store.FormatAmount(c.Amount))
-		}
-		w.Flush()
-	}
-	if len(sum.ByAccount) > 0 {
-		fmt.Println("\nBy account:")
-		w := tw()
-		fmt.Fprintln(w, "  ACCT\tINCOME\tEXPENSE\tNET")
-		for _, a := range sum.ByAccount {
-			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", a.AccountName,
-				store.FormatAmount(a.Income), store.FormatAmount(a.Expense), store.FormatAmount(a.Net))
 		}
 		w.Flush()
 	}

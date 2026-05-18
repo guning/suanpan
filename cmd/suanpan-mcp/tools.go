@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/goose/suanpan/internal/store"
@@ -24,9 +27,6 @@ func obj(props map[string]any, required ...string) map[string]any {
 func strProp(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
 func intProp(desc string) map[string]any { return map[string]any{"type": "integer", "description": desc} }
 func numProp(desc string) map[string]any { return map[string]any{"type": "number", "description": desc} }
-func boolProp(desc string) map[string]any {
-	return map[string]any{"type": "boolean", "description": desc}
-}
 
 // parseArgs unmarshals args into out. A nil / empty payload is treated as "{}".
 func parseArgs(args json.RawMessage, out any) error {
@@ -65,6 +65,25 @@ func parseDate(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("cannot parse date %q (want YYYY-MM-DD)", s)
+}
+
+// resolveScopePerson picks the caller identity for scoped reads, preferring
+// the explicit as_person_id argument and falling back to $SUANPAN_AS_PERSON.
+func resolveScopePerson(arg int64) (int64, error) {
+	if arg > 0 {
+		return arg, nil
+	}
+	if env := os.Getenv("SUANPAN_AS_PERSON"); env != "" {
+		v, err := strconv.ParseInt(env, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("$SUANPAN_AS_PERSON=%q: %w", env, err)
+		}
+		if v <= 0 {
+			return 0, fmt.Errorf("$SUANPAN_AS_PERSON must be a positive person id")
+		}
+		return v, nil
+	}
+	return 0, errors.New("as_person_id is required (or set $SUANPAN_AS_PERSON); scoped reads only return your family's data")
 }
 
 // ---- tool registry ----
@@ -165,110 +184,13 @@ func buildTools(s *store.Store) []toolDef {
 			},
 		},
 
-		// ---- account ----
-		{
-			Name: "create_account",
-			Description: "Create an account. owner_kind is 'person' or 'family'. " +
-				"initial_balance is a decimal string/number (e.g. \"100.00\").",
-			InputSchema: obj(map[string]any{
-				"name":            strProp("Account name"),
-				"type":            strProp("cash|bank|credit|investment|virtual"),
-				"currency":        strProp("ISO code, default CNY"),
-				"initial_balance": numProp("Decimal amount"),
-				"owner_kind":      strProp("person|family"),
-				"owner_id":        intProp("Owner id"),
-				"note":            strProp("Optional note"),
-			}, "name", "type", "owner_kind", "owner_id"),
-			handler: func(a json.RawMessage) (any, error) {
-				var p struct {
-					Name           string `json:"name"`
-					Type           string `json:"type"`
-					Currency       string `json:"currency"`
-					InitialBalance any    `json:"initial_balance"`
-					OwnerKind      string `json:"owner_kind"`
-					OwnerID        int64  `json:"owner_id"`
-					Note           string `json:"note"`
-				}
-				if err := parseArgs(a, &p); err != nil {
-					return nil, err
-				}
-				var init int64
-				if p.InitialBalance != nil {
-					v, err := moneyArg(p.InitialBalance)
-					if err != nil {
-						return nil, err
-					}
-					init = v
-				}
-				return s.CreateAccount(store.Account{
-					Name: p.Name, Type: p.Type, Currency: p.Currency,
-					InitialBalance: init, OwnerKind: p.OwnerKind, OwnerID: p.OwnerID,
-					Note: p.Note,
-				})
-			},
-		},
-		{
-			Name:        "list_accounts",
-			Description: "List accounts, optionally scoped to an owner. include_archived to show hidden.",
-			InputSchema: obj(map[string]any{
-				"owner_kind":       strProp("person|family"),
-				"owner_id":         intProp("Owner id"),
-				"include_archived": boolProp("Include archived accounts"),
-			}),
-			handler: func(a json.RawMessage) (any, error) {
-				var p struct {
-					OwnerKind       string `json:"owner_kind"`
-					OwnerID         int64  `json:"owner_id"`
-					IncludeArchived bool   `json:"include_archived"`
-				}
-				parseArgs(a, &p)
-				return s.ListAccounts(p.OwnerKind, p.OwnerID, p.IncludeArchived)
-			},
-		},
-		{
-			Name:        "archive_account",
-			Description: "Archive (or unarchive) an account.",
-			InputSchema: obj(map[string]any{
-				"id":       intProp("account id"),
-				"archived": boolProp("true=archive, false=unarchive (default true)"),
-			}, "id"),
-			handler: func(a json.RawMessage) (any, error) {
-				var p struct {
-					ID       int64
-					Archived *bool
-				}
-				parseArgs(a, &p)
-				arch := true
-				if p.Archived != nil {
-					arch = *p.Archived
-				}
-				return map[string]any{"ok": true}, s.ArchiveAccount(p.ID, arch)
-			},
-		},
-		{
-			Name:        "account_balances",
-			Description: "Current balance for each account (initial + income + incoming transfers − expense − outgoing transfers). Optional owner filter.",
-			InputSchema: obj(map[string]any{
-				"owner_kind": strProp("person|family"),
-				"owner_id":   intProp("Owner id"),
-			}),
-			handler: func(a json.RawMessage) (any, error) {
-				var p struct {
-					OwnerKind string `json:"owner_kind"`
-					OwnerID   int64  `json:"owner_id"`
-				}
-				parseArgs(a, &p)
-				return s.AccountBalances(p.OwnerKind, p.OwnerID)
-			},
-		},
-
 		// ---- category ----
 		{
 			Name:        "create_category",
 			Description: "Create a category. Omit owner_kind/owner_id for a global category.",
 			InputSchema: obj(map[string]any{
 				"name":       strProp("Category name"),
-				"kind":       strProp("income|expense|transfer"),
+				"kind":       strProp("income|expense"),
 				"parent_id":  intProp("Parent category id"),
 				"owner_kind": strProp("person|family (or empty for global)"),
 				"owner_id":   intProp("Owner id"),
@@ -295,7 +217,7 @@ func buildTools(s *store.Store) []toolDef {
 			Name:        "list_categories",
 			Description: "List categories. Empty owner_kind returns all; otherwise returns global + scoped.",
 			InputSchema: obj(map[string]any{
-				"kind":       strProp("income|expense|transfer"),
+				"kind":       strProp("income|expense"),
 				"owner_kind": strProp("person|family"),
 				"owner_id":   intProp("Owner id"),
 			}),
@@ -324,10 +246,10 @@ func buildTools(s *store.Store) []toolDef {
 		{
 			Name: "add_expense",
 			Description: "Record an expense. Either category_id or category_name may be supplied. " +
+				"At least one of person_id / family_id is required (every txn has an owner). " +
 				"date defaults to today; amount is decimal.",
 			InputSchema: obj(map[string]any{
 				"amount":        numProp("Decimal amount"),
-				"account_id":    intProp("Source account id"),
 				"category_id":   intProp("Category id"),
 				"category_name": strProp("Category name (resolved to id if provided)"),
 				"person_id":     intProp("Who made the expense"),
@@ -337,7 +259,7 @@ func buildTools(s *store.Store) []toolDef {
 				"note":          strProp("Note"),
 				"tags":          strProp("Comma-separated tags"),
 				"currency":      strProp("Currency, default CNY"),
-			}, "amount", "account_id"),
+			}, "amount"),
 			handler: func(a json.RawMessage) (any, error) {
 				return addTxn(s, a, "expense")
 			},
@@ -347,7 +269,6 @@ func buildTools(s *store.Store) []toolDef {
 			Description: "Record an income. Args mirror add_expense.",
 			InputSchema: obj(map[string]any{
 				"amount":        numProp("Decimal amount"),
-				"account_id":    intProp("Destination account id"),
 				"category_id":   intProp("Category id"),
 				"category_name": strProp("Category name"),
 				"person_id":     intProp("Who received"),
@@ -357,72 +278,42 @@ func buildTools(s *store.Store) []toolDef {
 				"note":          strProp("Note"),
 				"tags":          strProp("Tags"),
 				"currency":      strProp("Currency"),
-			}, "amount", "account_id"),
+			}, "amount"),
 			handler: func(a json.RawMessage) (any, error) {
 				return addTxn(s, a, "income")
 			},
 		},
 		{
-			Name:        "add_transfer",
-			Description: "Record a transfer between two accounts. amount > 0 moves from `from_account_id` to `to_account_id`.",
+			Name: "list_transactions",
+			Description: "Query transactions with filters. as_person_id (or $SUANPAN_AS_PERSON) " +
+				"scopes results to the caller's family — other families are invisible.",
 			InputSchema: obj(map[string]any{
-				"amount":          numProp("Decimal amount"),
-				"from_account_id": intProp("Source account"),
-				"to_account_id":   intProp("Destination account"),
-				"date":            strProp("YYYY-MM-DD"),
-				"note":            strProp("Note"),
-				"currency":        strProp("Currency"),
-			}, "amount", "from_account_id", "to_account_id"),
-			handler: func(a json.RawMessage) (any, error) {
-				var p struct {
-					Amount        any
-					FromAccountID int64  `json:"from_account_id"`
-					ToAccountID   int64  `json:"to_account_id"`
-					Date          string `json:"date"`
-					Note          string `json:"note"`
-					Currency      string `json:"currency"`
-				}
-				if err := parseArgs(a, &p); err != nil {
-					return nil, err
-				}
-				amt, err := moneyArg(p.Amount)
-				if err != nil {
-					return nil, err
-				}
-				when, err := parseDate(p.Date)
-				if err != nil {
-					return nil, err
-				}
-				to := p.ToAccountID
-				return s.CreateTxn(store.Txn{
-					OccurredAt: when, Kind: "transfer", Amount: amt,
-					Currency: p.Currency, AccountID: p.FromAccountID,
-					CounterAccountID: &to, Note: p.Note,
-				})
-			},
-		},
-		{
-			Name:        "list_transactions",
-			Description: "Query transactions with filters (date range, kind, account, person, family, category, search).",
-			InputSchema: obj(map[string]any{
-				"since":       strProp("Start date YYYY-MM-DD"),
-				"until":       strProp("End date YYYY-MM-DD"),
-				"kind":        strProp("income|expense|transfer"),
-				"account_id":  intProp("Account id"),
-				"person_id":   intProp("Person id"),
-				"family_id":   intProp("Family id"),
-				"category_id": intProp("Category id"),
-				"search":      strProp("Substring match in payee/note"),
-				"limit":       intProp("Max rows, default 50"),
-				"offset":      intProp("Offset, default 0"),
+				"as_person_id": intProp("Caller identity for family scope (or $SUANPAN_AS_PERSON)"),
+				"since":        strProp("Start date YYYY-MM-DD"),
+				"until":        strProp("End date YYYY-MM-DD"),
+				"kind":         strProp("income|expense"),
+				"person_id":    intProp("Person id"),
+				"family_id":    intProp("Family id"),
+				"category_id":  intProp("Category id"),
+				"search":       strProp("Substring match in payee/note"),
+				"limit":        intProp("Max rows, default 50"),
+				"offset":       intProp("Offset, default 0"),
 			}),
 			handler: func(a json.RawMessage) (any, error) {
-				var f store.TxnFilter
-				parseArgs(a, &f)
-				if f.Limit == 0 {
-					f.Limit = 50
+				var p struct {
+					AsPersonID int64 `json:"as_person_id"`
+					store.TxnFilter
 				}
-				return s.ListTxns(f)
+				parseArgs(a, &p)
+				scope, err := resolveScopePerson(p.AsPersonID)
+				if err != nil {
+					return nil, err
+				}
+				p.TxnFilter.ScopePersonID = scope
+				if p.TxnFilter.Limit == 0 {
+					p.TxnFilter.Limit = 50
+				}
+				return s.ListTxns(p.TxnFilter)
 			},
 		},
 		{
@@ -478,35 +369,47 @@ func buildTools(s *store.Store) []toolDef {
 		},
 		{
 			Name:        "list_budgets",
-			Description: "List budgets; optionally filter by owner.",
+			Description: "List budgets visible to the caller; family-scoped via as_person_id.",
 			InputSchema: obj(map[string]any{
-				"owner_kind": strProp("person|family"),
-				"owner_id":   intProp("Owner id"),
+				"as_person_id": intProp("Caller identity (or $SUANPAN_AS_PERSON)"),
+				"owner_kind":   strProp("person|family — optional narrower filter"),
+				"owner_id":     intProp("Owner id"),
 			}),
 			handler: func(a json.RawMessage) (any, error) {
 				var p struct {
-					OwnerKind string `json:"owner_kind"`
-					OwnerID   int64  `json:"owner_id"`
+					AsPersonID int64  `json:"as_person_id"`
+					OwnerKind  string `json:"owner_kind"`
+					OwnerID    int64  `json:"owner_id"`
 				}
 				parseArgs(a, &p)
-				return s.ListBudgets(p.OwnerKind, p.OwnerID)
+				scope, err := resolveScopePerson(p.AsPersonID)
+				if err != nil {
+					return nil, err
+				}
+				return s.ListBudgets(p.OwnerKind, p.OwnerID, scope)
 			},
 		},
 		{
 			Name:        "budget_status",
-			Description: "Compute spent/remaining for each budget at a reference date (default today).",
+			Description: "Compute spent/remaining for each visible budget at a reference date (default today).",
 			InputSchema: obj(map[string]any{
-				"owner_kind": strProp("person|family"),
-				"owner_id":   intProp("Owner id"),
-				"date":       strProp("YYYY-MM-DD"),
+				"as_person_id": intProp("Caller identity (or $SUANPAN_AS_PERSON)"),
+				"owner_kind":   strProp("person|family — optional narrower filter"),
+				"owner_id":     intProp("Owner id"),
+				"date":         strProp("YYYY-MM-DD"),
 			}),
 			handler: func(a json.RawMessage) (any, error) {
 				var p struct {
-					OwnerKind string `json:"owner_kind"`
-					OwnerID   int64  `json:"owner_id"`
-					Date      string `json:"date"`
+					AsPersonID int64  `json:"as_person_id"`
+					OwnerKind  string `json:"owner_kind"`
+					OwnerID    int64  `json:"owner_id"`
+					Date       string `json:"date"`
 				}
 				parseArgs(a, &p)
+				scope, err := resolveScopePerson(p.AsPersonID)
+				if err != nil {
+					return nil, err
+				}
 				ref := time.Now()
 				if p.Date != "" {
 					t, err := parseDate(p.Date)
@@ -517,7 +420,7 @@ func buildTools(s *store.Store) []toolDef {
 						ref = t
 					}
 				}
-				bs, err := s.ListBudgets(p.OwnerKind, p.OwnerID)
+				bs, err := s.ListBudgets(p.OwnerKind, p.OwnerID, scope)
 				if err != nil {
 					return nil, err
 				}
@@ -545,26 +448,36 @@ func buildTools(s *store.Store) []toolDef {
 
 		// ---- report ----
 		{
-			Name:        "summarize",
-			Description: "Summarize income/expense for a period with breakdowns by category and account. Defaults to current month when since/until omitted.",
+			Name: "summarize",
+			Description: "Summarize income/expense for a period with breakdown by category. " +
+				"Defaults to current month when since/until omitted. " +
+				"as_person_id (or $SUANPAN_AS_PERSON) scopes results to the caller's family.",
 			InputSchema: obj(map[string]any{
-				"since":      strProp("YYYY-MM-DD"),
-				"until":      strProp("YYYY-MM-DD"),
-				"person_id":  intProp("Filter by person"),
-				"family_id":  intProp("Filter by family"),
-				"account_id": intProp("Filter by account"),
+				"as_person_id": intProp("Caller identity (or $SUANPAN_AS_PERSON)"),
+				"since":        strProp("YYYY-MM-DD"),
+				"until":        strProp("YYYY-MM-DD"),
+				"person_id":    intProp("Filter by person"),
+				"family_id":    intProp("Filter by family"),
 			}),
 			handler: func(a json.RawMessage) (any, error) {
-				var f store.TxnFilter
-				parseArgs(a, &f)
-				if f.Since == "" && f.Until == "" {
+				var p struct {
+					AsPersonID int64 `json:"as_person_id"`
+					store.TxnFilter
+				}
+				parseArgs(a, &p)
+				scope, err := resolveScopePerson(p.AsPersonID)
+				if err != nil {
+					return nil, err
+				}
+				p.TxnFilter.ScopePersonID = scope
+				if p.TxnFilter.Since == "" && p.TxnFilter.Until == "" {
 					now := time.Now()
 					start := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 					end := start.AddDate(0, 1, -1)
-					f.Since = start.Format("2006-01-02")
-					f.Until = end.Format("2006-01-02")
+					p.TxnFilter.Since = start.Format("2006-01-02")
+					p.TxnFilter.Until = end.Format("2006-01-02")
 				}
-				return s.Summarize(f)
+				return s.Summarize(p.TxnFilter)
 			},
 		},
 	}
@@ -574,7 +487,6 @@ func buildTools(s *store.Store) []toolDef {
 func addTxn(s *store.Store, a json.RawMessage, kind string) (any, error) {
 	var p struct {
 		Amount       any
-		AccountID    int64  `json:"account_id"`
 		CategoryID   *int64 `json:"category_id"`
 		CategoryName string `json:"category_name"`
 		PersonID     *int64 `json:"person_id"`
@@ -586,6 +498,9 @@ func addTxn(s *store.Store, a json.RawMessage, kind string) (any, error) {
 	}
 	if err := parseArgs(a, &p); err != nil {
 		return nil, err
+	}
+	if p.PersonID == nil && p.FamilyID == nil {
+		return nil, errors.New("person_id or family_id is required (every txn must have an owner)")
 	}
 	amt, err := moneyArg(p.Amount)
 	if err != nil {
@@ -608,8 +523,8 @@ func addTxn(s *store.Store, a json.RawMessage, kind string) (any, error) {
 	}
 	return s.CreateTxn(store.Txn{
 		OccurredAt: when, Kind: kind, Amount: amt, Currency: p.Currency,
-		AccountID: p.AccountID, CategoryID: catID,
-		PersonID: p.PersonID, FamilyID: p.FamilyID,
+		CategoryID: catID,
+		PersonID:   p.PersonID, FamilyID: p.FamilyID,
 		Payee: p.Payee, Note: p.Note, Tags: p.Tags,
 	})
 }
