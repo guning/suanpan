@@ -139,6 +139,108 @@ func TestCLI_RejectsInvalidAmount(t *testing.T) {
 	}
 }
 
+// ---------- category update ----------
+
+func TestCLI_CategoryUpdate(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+
+	// List categories and find "餐饮" id.
+	r := mustRun(t, db, "category", "list", "-json")
+	if !strings.Contains(r.stdout, `"name": "餐饮"`) {
+		t.Fatalf("expected 餐饮 in categories: %s", r.stdout)
+	}
+
+	// Rename + change icon.
+	mustRun(t, db, "category", "update", "-id", "1", "-name", "美食", "-icon", "🍜")
+
+	// Verify via JSON list.
+	r = mustRun(t, db, "category", "list", "-json")
+	if !strings.Contains(r.stdout, `"name": "美食"`) {
+		t.Errorf("expected name 美食 in %s", r.stdout)
+	}
+	if strings.Contains(r.stdout, `"name": "餐饮"`) {
+		t.Errorf("expected old name 餐饮 NOT to be there: %s", r.stdout)
+	}
+}
+
+func TestCLI_CategoryUpdateRejectsNoID(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	r := runCLI(t, db, "category", "update", "-name", "foo")
+	if r.code == 0 {
+		t.Fatal("expected non-zero exit for missing -id")
+	}
+}
+
+func TestCLI_CategoryUpdateRejectsNoFields(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	r := runCLI(t, db, "category", "update", "-id", "1")
+	if r.code == 0 {
+		t.Fatal("expected non-zero exit for no fields")
+	}
+}
+
+// ---------- txn update ----------
+
+func TestCLI_TxnUpdateCategory(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	mustRun(t, db, "person", "add", "-name", "u")
+	mustRun(t, db, "account", "add", "-name", "A", "-type", "cash", "-owner", "person:1")
+	mustRun(t, db, "txn", "add", "-amount", "50", "-account", "1", "-kind", "expense", "-category-name", "餐饮")
+
+	// Verify it's in 餐饮 (category id 1).
+	r := mustRun(t, db, "txn", "list", "-json", "-limit", "10")
+	if !strings.Contains(r.stdout, `"category_id": 1`) {
+		t.Fatalf("expected category_id=1: %s", r.stdout)
+	}
+
+	// Re-categorize to 购物 (category id 3).
+	mustRun(t, db, "txn", "update", "-id", "1", "-category", "3")
+
+	r = mustRun(t, db, "txn", "list", "-json", "-limit", "10")
+	if strings.Contains(r.stdout, `"category_id": 1`) {
+		t.Errorf("expected old category to be gone: %s", r.stdout)
+	}
+	if !strings.Contains(r.stdout, `"category_id": 3`) {
+		t.Errorf("expected new category_id=3: %s", r.stdout)
+	}
+}
+
+func TestCLI_TxnUpdateCategoryByName(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	mustRun(t, db, "person", "add", "-name", "u")
+	mustRun(t, db, "account", "add", "-name", "A", "-type", "cash", "-owner", "person:1")
+	mustRun(t, db, "txn", "add", "-amount", "30", "-account", "1", "-kind", "expense", "-category-name", "餐饮")
+
+	// Re-categorize by name.
+	mustRun(t, db, "txn", "update", "-id", "1", "-category-name", "购物")
+
+	r := mustRun(t, db, "txn", "list", "-json", "-limit", "10")
+	if !strings.Contains(r.stdout, `"category_id": 3`) {
+		t.Errorf("expected category_id=3 (购物): %s", r.stdout)
+	}
+}
+
+func TestCLI_TxnUpdateClearCategory(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	mustRun(t, db, "person", "add", "-name", "u")
+	mustRun(t, db, "account", "add", "-name", "A", "-type", "cash", "-owner", "person:1")
+	mustRun(t, db, "txn", "add", "-amount", "20", "-account", "1", "-kind", "expense", "-category-name", "餐饮")
+
+	// Clear category.
+	mustRun(t, db, "txn", "update", "-id", "1", "-clear-category")
+
+	r := mustRun(t, db, "txn", "list", "-json", "-limit", "10")
+	if strings.Contains(r.stdout, `"category_id"`) {
+		t.Errorf("expected category to be cleared: %s", r.stdout)
+	}
+}
+
 func TestCLI_UnknownCommand(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "s.db")
 	r := runCLI(t, db, "foobar")

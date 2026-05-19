@@ -357,3 +357,145 @@ func TestBudgetStatus(t *testing.T) {
 		t.Errorf("over-budget remaining=%d", st2.Remaining)
 	}
 }
+
+// ---------- UpdateCategory ----------
+
+func TestUpdateCategoryRename(t *testing.T) {
+	s := newTestStore(t)
+	c, _ := s.FindCategoryByName("餐饮", "expense")
+	updated, err := s.UpdateCategory(c.ID, "美食", "", "", nil, false)
+	if err != nil {
+		t.Fatalf("UpdateCategory: %v", err)
+	}
+	if updated.Name != "美食" {
+		t.Errorf("name=%q, want 美食", updated.Name)
+	}
+	if updated.Kind != "expense" {
+		t.Errorf("kind=%q, want expense", updated.Kind)
+	}
+}
+
+func TestUpdateCategoryIcon(t *testing.T) {
+	s := newTestStore(t)
+	c, _ := s.FindCategoryByName("交通", "expense")
+	updated, err := s.UpdateCategory(c.ID, "", "", "🚌", nil, false)
+	if err != nil {
+		t.Fatalf("UpdateCategory: %v", err)
+	}
+	if updated.Icon != "🚌" {
+		t.Errorf("icon=%q, want 🚌", updated.Icon)
+	}
+	if updated.Name != "交通" {
+		t.Errorf("name changed to %q", updated.Name)
+	}
+}
+
+func TestUpdateCategoryKind(t *testing.T) {
+	s := newTestStore(t)
+	c, _ := s.FindCategoryByName("餐饮", "expense")
+	updated, err := s.UpdateCategory(c.ID, "", "income", "", nil, false)
+	if err != nil {
+		t.Fatalf("UpdateCategory: %v", err)
+	}
+	if updated.Kind != "income" {
+		t.Errorf("kind=%q, want income", updated.Kind)
+	}
+}
+
+func TestUpdateCategoryNotFound(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.UpdateCategory(9999, "不存在", "", "", nil, false)
+	if err == nil {
+		t.Fatal("expected error for nonexistent category")
+	}
+}
+
+func TestUpdateCategoryAllFields(t *testing.T) {
+	s := newTestStore(t)
+	c, _ := s.FindCategoryByName("娱乐", "expense")
+	updated, err := s.UpdateCategory(c.ID, "游戏", "income", "🎮", nil, false)
+	if err != nil {
+		t.Fatalf("UpdateCategory: %v", err)
+	}
+	if updated.Name != "游戏" || updated.Kind != "income" || updated.Icon != "🎮" {
+		t.Errorf("got %+v", updated)
+	}
+}
+
+func TestUpdateCategoryClearParent(t *testing.T) {
+	s := newTestStore(t)
+	// Create a parent category and a child.
+	parent, err := s.CreateCategory(Category{Name: "父分类", Kind: "expense"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := s.CreateCategory(Category{Name: "子分类", Kind: "expense", ParentID: &parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.ParentID == nil || *child.ParentID != parent.ID {
+		t.Fatal("parent not set")
+	}
+	// Clear parent.
+	updated, err := s.UpdateCategory(child.ID, "", "", "", nil, true)
+	if err != nil {
+		t.Fatalf("UpdateCategory: %v", err)
+	}
+	if updated.ParentID != nil {
+		t.Errorf("expected nil parent, got %d", *updated.ParentID)
+	}
+}
+
+// ---------- UpdateTxnCategory ----------
+
+func TestUpdateTxnCategoryOnly(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePerson("u", nil, "")
+	a, _ := s.CreateAccount(Account{Name: "A", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
+	txn, _ := s.CreateTxn(Txn{Kind: "expense", Amount: 1000, AccountID: a.ID})
+	if txn.CategoryID != nil {
+		t.Fatal("expected nil category initially")
+	}
+	food, _ := s.FindCategoryByName("餐饮", "expense")
+	updated, err := s.UpdateTxnCategory(txn.ID, &food.ID)
+	if err != nil {
+		t.Fatalf("UpdateTxnCategory: %v", err)
+	}
+	if updated.CategoryID == nil || *updated.CategoryID != food.ID {
+		t.Errorf("category_id=%v, want %d", updated.CategoryID, food.ID)
+	}
+}
+
+func TestUpdateTxnCategoryClear(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePerson("u", nil, "")
+	a, _ := s.CreateAccount(Account{Name: "A", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
+	food, _ := s.FindCategoryByName("餐饮", "expense")
+	txn, _ := s.CreateTxn(Txn{Kind: "expense", Amount: 1000, AccountID: a.ID, CategoryID: &food.ID})
+	if txn.CategoryID == nil {
+		t.Fatal("expected category initially")
+	}
+	updated, err := s.UpdateTxnCategory(txn.ID, nil)
+	if err != nil {
+		t.Fatalf("UpdateTxnCategory: %v", err)
+	}
+	if updated.CategoryID != nil {
+		t.Errorf("expected cleared category, got %v", *updated.CategoryID)
+	}
+}
+
+func TestUpdateTxnCategorySwap(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePerson("u", nil, "")
+	a, _ := s.CreateAccount(Account{Name: "A", Type: "cash", OwnerKind: "person", OwnerID: p.ID})
+	food, _ := s.FindCategoryByName("餐饮", "expense")
+	shop, _ := s.FindCategoryByName("购物", "expense")
+	txn, _ := s.CreateTxn(Txn{Kind: "expense", Amount: 1000, AccountID: a.ID, CategoryID: &food.ID})
+	updated, err := s.UpdateTxnCategory(txn.ID, &shop.ID)
+	if err != nil {
+		t.Fatalf("UpdateTxnCategory: %v", err)
+	}
+	if updated.CategoryID == nil || *updated.CategoryID != shop.ID {
+		t.Errorf("category_id=%v, want %d", updated.CategoryID, shop.ID)
+	}
+}
