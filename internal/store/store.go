@@ -434,6 +434,44 @@ func (s *Store) ListCategories(kind, ownerKind string, ownerID int64) ([]Categor
 	return out, rows.Err()
 }
 
+// UpdateCategory updates a category's mutable fields. Only non-zero/non-empty
+// values are applied — pass 0/"" to leave a field unchanged.
+func (s *Store) UpdateCategory(id int64, name, kind, icon string, parentID *int64) (*Category, error) {
+	c, err := s.GetCategory(id)
+	if err != nil {
+		return nil, fmt.Errorf("get category %d: %w", id, err)
+	}
+	if c == nil {
+		return nil, fmt.Errorf("category %d not found", id)
+	}
+	newName := c.Name
+	newKind := c.Kind
+	newIcon := c.Icon
+	var newParent *int64
+	if c.ParentID != nil {
+		v := *c.ParentID
+		newParent = &v
+	}
+	if name != "" {
+		newName = name
+	}
+	if kind != "" {
+		newKind = kind
+	}
+	if icon != "" {
+		newIcon = icon
+	}
+	if parentID != nil {
+		newParent = parentID
+	}
+	_, err = s.DB.Exec(`UPDATE category SET name=?, kind=?, icon=?, parent_id=? WHERE id=?`,
+		newName, newKind, nullIfEmpty(newIcon), nullableInt(newParent), id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetCategory(id)
+}
+
 func (s *Store) DeleteCategory(id int64) error {
 	_, err := s.DB.Exec(`DELETE FROM category WHERE id=?`, id)
 	return err
@@ -529,6 +567,16 @@ func (s *Store) GetTxn(id int64) (*Txn, error) {
 	t.OccurredAt = parseTime(occurred)
 	t.CreatedAt = parseTime(created)
 	return &t, nil
+}
+
+// UpdateTxnCategory updates the category_id of an existing transaction.
+// Pass nil for categoryID to clear the category.
+func (s *Store) UpdateTxnCategory(id int64, categoryID *int64) (*Txn, error) {
+	_, err := s.DB.Exec(`UPDATE txn SET category_id=? WHERE id=?`, nullableInt(categoryID), id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetTxn(id)
 }
 
 func (s *Store) DeleteTxn(id int64) error {

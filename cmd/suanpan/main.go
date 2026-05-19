@@ -456,7 +456,7 @@ func cmdAccount(args []string) error {
 
 func cmdCategory(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: suanpan category <add|list|rm> ...")
+		return errors.New("usage: suanpan category <add|list|update|rm> ...")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -534,6 +534,41 @@ func cmdCategory(args []string) error {
 			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", c.ID, c.Name, c.Kind, c.Icon, scope)
 		}
 		w.Flush()
+	case "update":
+		fs := flag.NewFlagSet("category update", flag.ExitOnError)
+		id := fs.Int64("id", 0, "category id (required)")
+		name := fs.String("name", "", "new name")
+		kind := fs.String("kind", "", "new kind: income|expense|transfer")
+		icon := fs.String("icon", "", "new emoji/icon")
+		parent := fs.Int64("parent", 0, "new parent category id")
+		parentClear := fs.Bool("parent-clear", false, "clear parent")
+		asJSON := fs.Bool("json", false, "output JSON")
+		fs.Parse(rest)
+		if *id == 0 {
+			return errors.New("-id is required")
+		}
+		if *name == "" && *kind == "" && *icon == "" && !*parentClear && *parent == 0 {
+			return errors.New("at least one field to update: -name, -kind, -icon, -parent, or -parent-clear")
+		}
+		st, err := openStore()
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		var pid *int64
+		if *parentClear {
+			pid = new(int64)
+		} else if *parent != 0 {
+			pid = parent
+		}
+		c, err := st.UpdateCategory(*id, *name, *kind, *icon, pid)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return emitJSON(c)
+		}
+		fmt.Printf("category #%d %s (%s) updated\n", c.ID, c.Name, c.Kind)
 	case "rm":
 		fs := flag.NewFlagSet("category rm", flag.ExitOnError)
 		id := fs.Int64("id", 0, "category id")
@@ -557,7 +592,7 @@ func cmdCategory(args []string) error {
 
 func cmdTxn(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: suanpan txn <add|transfer|list|rm> ...")
+		return errors.New("usage: suanpan txn <add|transfer|list|update|rm> ...")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -716,6 +751,52 @@ func cmdTxn(args []string) error {
 				cat, per, t.Payee, truncate(t.Note, 20))
 		}
 		w.Flush()
+	case "update":
+		fs := flag.NewFlagSet("txn update", flag.ExitOnError)
+		id := fs.Int64("id", 0, "txn id (required)")
+		category := fs.Int64("category", 0, "new category id")
+		categoryName := fs.String("category-name", "", "new category name (resolved to id)")
+		clearCategory := fs.Bool("clear-category", false, "remove category from txn")
+		asJSON := fs.Bool("json", false, "output JSON")
+		fs.Parse(rest)
+		if *id == 0 {
+			return errors.New("-id is required")
+		}
+		if *category == 0 && *categoryName == "" && !*clearCategory {
+			return errors.New("specify -category, -category-name, or -clear-category")
+		}
+		st, err := openStore()
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		var catID *int64
+		if *clearCategory {
+			// leave nil to clear
+		} else if *categoryName != "" {
+			t, err := st.GetTxn(*id)
+			if err != nil {
+				return fmt.Errorf("get txn %d: %w", *id, err)
+			}
+			c, err := st.FindCategoryByName(*categoryName, t.Kind)
+			if err != nil {
+				return err
+			}
+			if c == nil {
+				return fmt.Errorf("no category matches %q", *categoryName)
+			}
+			catID = &c.ID
+		} else if *category != 0 {
+			catID = category
+		}
+		t, err := st.UpdateTxnCategory(*id, catID)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return emitJSON(t)
+		}
+		fmt.Printf("txn #%d category updated\n", t.ID)
 	case "rm":
 		fs := flag.NewFlagSet("txn rm", flag.ExitOnError)
 		id := fs.Int64("id", 0, "txn id")
