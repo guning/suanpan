@@ -557,11 +557,11 @@ func cmdCategory(args []string) error {
 		defer st.Close()
 		var pid *int64
 		if *parentClear {
-			pid = new(int64)
+			// pid stays nil — signal to store to set NULL
 		} else if *parent != 0 {
 			pid = parent
 		}
-		c, err := st.UpdateCategory(*id, *name, *kind, *icon, pid)
+		c, err := st.UpdateCategory(*id, *name, *kind, *icon, pid, *parentClear)
 		if err != nil {
 			return err
 		}

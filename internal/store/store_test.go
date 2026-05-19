@@ -363,7 +363,7 @@ func TestBudgetStatus(t *testing.T) {
 func TestUpdateCategoryRename(t *testing.T) {
 	s := newTestStore(t)
 	c, _ := s.FindCategoryByName("餐饮", "expense")
-	updated, err := s.UpdateCategory(c.ID, "美食", "", "", nil)
+	updated, err := s.UpdateCategory(c.ID, "美食", "", "", nil, false)
 	if err != nil {
 		t.Fatalf("UpdateCategory: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestUpdateCategoryRename(t *testing.T) {
 func TestUpdateCategoryIcon(t *testing.T) {
 	s := newTestStore(t)
 	c, _ := s.FindCategoryByName("交通", "expense")
-	updated, err := s.UpdateCategory(c.ID, "", "", "🚌", nil)
+	updated, err := s.UpdateCategory(c.ID, "", "", "🚌", nil, false)
 	if err != nil {
 		t.Fatalf("UpdateCategory: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestUpdateCategoryIcon(t *testing.T) {
 func TestUpdateCategoryKind(t *testing.T) {
 	s := newTestStore(t)
 	c, _ := s.FindCategoryByName("餐饮", "expense")
-	updated, err := s.UpdateCategory(c.ID, "", "income", "", nil)
+	updated, err := s.UpdateCategory(c.ID, "", "income", "", nil, false)
 	if err != nil {
 		t.Fatalf("UpdateCategory: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestUpdateCategoryKind(t *testing.T) {
 
 func TestUpdateCategoryNotFound(t *testing.T) {
 	s := newTestStore(t)
-	_, err := s.UpdateCategory(9999, "不存在", "", "", nil)
+	_, err := s.UpdateCategory(9999, "不存在", "", "", nil, false)
 	if err == nil {
 		t.Fatal("expected error for nonexistent category")
 	}
@@ -413,12 +413,36 @@ func TestUpdateCategoryNotFound(t *testing.T) {
 func TestUpdateCategoryAllFields(t *testing.T) {
 	s := newTestStore(t)
 	c, _ := s.FindCategoryByName("娱乐", "expense")
-	updated, err := s.UpdateCategory(c.ID, "游戏", "income", "🎮", nil)
+	updated, err := s.UpdateCategory(c.ID, "游戏", "income", "🎮", nil, false)
 	if err != nil {
 		t.Fatalf("UpdateCategory: %v", err)
 	}
 	if updated.Name != "游戏" || updated.Kind != "income" || updated.Icon != "🎮" {
 		t.Errorf("got %+v", updated)
+	}
+}
+
+func TestUpdateCategoryClearParent(t *testing.T) {
+	s := newTestStore(t)
+	// Create a parent category and a child.
+	parent, err := s.CreateCategory(Category{Name: "父分类", Kind: "expense"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := s.CreateCategory(Category{Name: "子分类", Kind: "expense", ParentID: &parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.ParentID == nil || *child.ParentID != parent.ID {
+		t.Fatal("parent not set")
+	}
+	// Clear parent.
+	updated, err := s.UpdateCategory(child.ID, "", "", "", nil, true)
+	if err != nil {
+		t.Fatalf("UpdateCategory: %v", err)
+	}
+	if updated.ParentID != nil {
+		t.Errorf("expected nil parent, got %d", *updated.ParentID)
 	}
 }
 

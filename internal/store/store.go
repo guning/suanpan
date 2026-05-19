@@ -436,7 +436,8 @@ func (s *Store) ListCategories(kind, ownerKind string, ownerID int64) ([]Categor
 
 // UpdateCategory updates a category's mutable fields. Only non-zero/non-empty
 // values are applied — pass 0/"" to leave a field unchanged.
-func (s *Store) UpdateCategory(id int64, name, kind, icon string, parentID *int64) (*Category, error) {
+// Pass clearParent=true to set parent_id to NULL (remove parent).
+func (s *Store) UpdateCategory(id int64, name, kind, icon string, parentID *int64, clearParent bool) (*Category, error) {
 	c, err := s.GetCategory(id)
 	if err != nil {
 		return nil, fmt.Errorf("get category %d: %w", id, err)
@@ -461,7 +462,9 @@ func (s *Store) UpdateCategory(id int64, name, kind, icon string, parentID *int6
 	if icon != "" {
 		newIcon = icon
 	}
-	if parentID != nil {
+	if clearParent {
+		newParent = nil // explicit NULL in SQL
+	} else if parentID != nil {
 		newParent = parentID
 	}
 	_, err = s.DB.Exec(`UPDATE category SET name=?, kind=?, icon=?, parent_id=? WHERE id=?`,
