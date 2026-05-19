@@ -308,6 +308,43 @@ func TestTxnValidation(t *testing.T) {
 	}
 }
 
+func TestUpdateTxnCategory(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePerson("u", nil, "")
+	food, _ := s.FindCategoryByName("餐饮", "expense")
+	transit, _ := s.FindCategoryByName("交通", "expense")
+
+	tx, err := s.CreateTxn(Txn{
+		Kind: "expense", Amount: 100, PersonID: &p.ID, CategoryID: &food.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// switch to a different category
+	if err := s.UpdateTxnCategory(tx.ID, &transit.ID); err != nil {
+		t.Fatalf("update to transit: %v", err)
+	}
+	got, _ := s.GetTxn(tx.ID)
+	if got.CategoryID == nil || *got.CategoryID != transit.ID {
+		t.Errorf("want category=%d, got %v", transit.ID, got.CategoryID)
+	}
+
+	// clear category
+	if err := s.UpdateTxnCategory(tx.ID, nil); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	got, _ = s.GetTxn(tx.ID)
+	if got.CategoryID != nil {
+		t.Errorf("want cleared, got %v", *got.CategoryID)
+	}
+
+	// unknown id → error
+	if err := s.UpdateTxnCategory(999999, &food.ID); err == nil {
+		t.Error("expected error for unknown txn id")
+	}
+}
+
 // ---------- categories ----------
 
 func TestFindCategoryByName(t *testing.T) {

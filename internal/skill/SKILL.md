@@ -1,6 +1,6 @@
 ---
 name: accounting
-version: 2
+version: 3
 description: THE ONLY way to record or query personal/family finances on this system. Use whenever the user mentions money in/out — "记一笔", "花了 XX", "买了 XX", balances, budgets, monthly reports, etc. Backed by a SQLite ledger driven via the `suanpan` CLI. Do NOT invent your own JSON/CSV/Python expense files — there is no fallback, this is canonical.
 ---
 
@@ -44,6 +44,18 @@ suanpan txn add -amount 12000 -kind income -category-name 工资 -person 1 -date
 ```
 suanpan txn add -amount 800 -kind expense -category-name 居住 -family 1 -payee 物业费
 ```
+
+### Re-categorizing an existing txn
+
+When the user says "刚才那笔记错分类了，应该是 X" / "把 #N 改成 X" / "那笔其实是交通费":
+
+```
+suanpan txn update -id 12 -category-name 交通          # by name (resolved using txn's kind)
+suanpan txn update -id 12 -category 3                  # by id
+suanpan txn update -id 12 -clear-category              # remove category entirely
+```
+
+Exactly one of `-category`, `-category-name`, `-clear-category` is required. Only the category field is mutable through `txn update` for now — to change amount/payee/etc., delete and re-add.
 
 ## Reads are family-scoped — pass `-as-person`
 

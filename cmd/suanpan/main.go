@@ -450,7 +450,7 @@ func cmdCategory(args []string) error {
 
 func cmdTxn(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: suanpan txn <add|list|rm> ...")
+		return errors.New("usage: suanpan txn <add|list|update|rm> ...")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -577,6 +577,70 @@ func cmdTxn(args []string) error {
 				cat, per, t.Payee, truncate(t.Note, 20))
 		}
 		w.Flush()
+	case "update":
+		fs := flag.NewFlagSet("txn update", flag.ExitOnError)
+		id := fs.Int64("id", 0, "txn id (required)")
+		category := fs.Int64("category", 0, "new category id")
+		categoryName := fs.String("category-name", "", "new category name (resolved using txn's kind)")
+		clearCategory := fs.Bool("clear-category", false, "clear category (set to NULL)")
+		asJSON := fs.Bool("json", false, "output JSON")
+		fs.Parse(rest)
+		if *id == 0 {
+			return errors.New("-id is required")
+		}
+		picks := 0
+		if *category != 0 {
+			picks++
+		}
+		if *categoryName != "" {
+			picks++
+		}
+		if *clearCategory {
+			picks++
+		}
+		if picks != 1 {
+			return errors.New("exactly one of -category, -category-name, -clear-category required")
+		}
+		s, err := openStore()
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		var catID *int64
+		switch {
+		case *clearCategory:
+			// catID stays nil
+		case *category != 0:
+			catID = category
+		default:
+			existing, err := s.GetTxn(*id)
+			if err != nil {
+				return err
+			}
+			c, err := s.FindCategoryByName(*categoryName, existing.Kind)
+			if err != nil {
+				return err
+			}
+			if c == nil {
+				return fmt.Errorf("no category matches %q (kind=%s)", *categoryName, existing.Kind)
+			}
+			catID = &c.ID
+		}
+		if err := s.UpdateTxnCategory(*id, catID); err != nil {
+			return err
+		}
+		t, err := s.GetTxn(*id)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return emitJSON(t)
+		}
+		cat := "-"
+		if t.CategoryID != nil {
+			cat = strconv.FormatInt(*t.CategoryID, 10)
+		}
+		fmt.Printf("txn #%d category → %s\n", t.ID, cat)
 	case "rm":
 		fs := flag.NewFlagSet("txn rm", flag.ExitOnError)
 		id := fs.Int64("id", 0, "txn id")

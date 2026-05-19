@@ -189,6 +189,54 @@ func TestCLI_ScopeHidesOtherFamily(t *testing.T) {
 	}
 }
 
+func TestCLI_TxnUpdateCategory(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	mustRun(t, db, "person", "add", "-name", "u")
+	mustRun(t, db, "txn", "add", "-amount", "10", "-kind", "expense", "-category-name", "餐饮", "-person", "1")
+
+	// By name → resolves against txn's kind (expense), picks 交通.
+	r := mustRun(t, db, "txn", "update", "-id", "1", "-category-name", "交通")
+	if !strings.Contains(r.stdout, "txn #1 category →") {
+		t.Errorf("update stdout: %q", r.stdout)
+	}
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-01-01", "-limit", "5", "-json")
+	// 交通 is the 2nd seeded expense category (id=2).
+	if !strings.Contains(r.stdout, `"category_id": 2`) {
+		t.Errorf("expected category_id=2 after rename, got: %s", r.stdout)
+	}
+
+	// By id.
+	mustRun(t, db, "txn", "update", "-id", "1", "-category", "3")
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-01-01", "-limit", "5", "-json")
+	if !strings.Contains(r.stdout, `"category_id": 3`) {
+		t.Errorf("expected category_id=3 after id update, got: %s", r.stdout)
+	}
+
+	// Clear.
+	mustRun(t, db, "txn", "update", "-id", "1", "-clear-category")
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-01-01", "-limit", "5", "-json")
+	if strings.Contains(r.stdout, `"category_id":`) {
+		t.Errorf("expected category cleared, got: %s", r.stdout)
+	}
+
+	// XOR validation: passing none.
+	r = runCLI(t, db, "txn", "update", "-id", "1")
+	if r.code == 0 || !strings.Contains(r.stderr, "exactly one of") {
+		t.Errorf("expected XOR error, code=%d stderr=%q", r.code, r.stderr)
+	}
+	// XOR validation: passing two.
+	r = runCLI(t, db, "txn", "update", "-id", "1", "-category", "1", "-clear-category")
+	if r.code == 0 || !strings.Contains(r.stderr, "exactly one of") {
+		t.Errorf("expected XOR error with two flags, code=%d stderr=%q", r.code, r.stderr)
+	}
+	// Unknown id.
+	r = runCLI(t, db, "txn", "update", "-id", "999", "-category", "1")
+	if r.code == 0 || !strings.Contains(r.stderr, "not found") {
+		t.Errorf("expected not-found error, code=%d stderr=%q", r.code, r.stderr)
+	}
+}
+
 func TestCLI_UnknownCommand(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "s.db")
 	r := runCLI(t, db, "foobar")
