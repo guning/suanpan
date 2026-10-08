@@ -220,10 +220,10 @@ func TestCLI_TxnUpdateCategory(t *testing.T) {
 		t.Errorf("expected category cleared, got: %s", r.stdout)
 	}
 
-	// XOR validation: passing none.
+	// No action at all → error listing the supported flags.
 	r = runCLI(t, db, "txn", "update", "-id", "1")
-	if r.code == 0 || !strings.Contains(r.stderr, "exactly one of") {
-		t.Errorf("expected XOR error, code=%d stderr=%q", r.code, r.stderr)
+	if r.code == 0 || !strings.Contains(r.stderr, "-tags") {
+		t.Errorf("expected no-action error listing flags, code=%d stderr=%q", r.code, r.stderr)
 	}
 	// XOR validation: passing two.
 	r = runCLI(t, db, "txn", "update", "-id", "1", "-category", "1", "-clear-category")
@@ -232,6 +232,67 @@ func TestCLI_TxnUpdateCategory(t *testing.T) {
 	}
 	// Unknown id.
 	r = runCLI(t, db, "txn", "update", "-id", "999", "-category", "1")
+	if r.code == 0 || !strings.Contains(r.stderr, "not found") {
+		t.Errorf("expected not-found error, code=%d stderr=%q", r.code, r.stderr)
+	}
+}
+
+func TestCLI_TxnUpdateTags(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	mustRun(t, db, "person", "add", "-name", "u")
+	mustRun(t, db, "txn", "add", "-amount", "10", "-kind", "expense", "-category-name", "餐饮", "-person", "1", "-date", "2026-04-10")
+
+	// Set tags on the (untagged) txn.
+	r := mustRun(t, db, "txn", "update", "-id", "1", "-tags", "旅行,新疆")
+	if !strings.Contains(r.stdout, "txn #1 tags → 旅行,新疆") {
+		t.Errorf("update tags stdout: %q", r.stdout)
+	}
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "新疆", "-json")
+	if !strings.Contains(r.stdout, `"amount": 1000`) {
+		t.Errorf("expected the tagged txn: %s", r.stdout)
+	}
+
+	// Replace drops the old tag, keeps only the new one.
+	mustRun(t, db, "txn", "update", "-id", "1", "-tags", "美食")
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "新疆", "-json")
+	if strings.Contains(r.stdout, `"amount"`) {
+		t.Errorf("old tag 新疆 should be gone after replace: %s", r.stdout)
+	}
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "美食", "-json")
+	if !strings.Contains(r.stdout, `"amount": 1000`) {
+		t.Errorf("new tag 美食 should match after replace: %s", r.stdout)
+	}
+
+	// Combined category + tags edit in one call.
+	r = mustRun(t, db, "txn", "update", "-id", "1", "-tags", "新疆", "-category-name", "交通")
+	if !strings.Contains(r.stdout, "txn #1 category →") || !strings.Contains(r.stdout, "txn #1 tags → 新疆") {
+		t.Errorf("combined update stdout: %q", r.stdout)
+	}
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "新疆", "-json")
+	// 交通 is the 2nd seeded expense category (id=2).
+	if !strings.Contains(r.stdout, `"category_id": 2`) || !strings.Contains(r.stdout, `"tags": "新疆"`) {
+		t.Errorf("combined update should set both category and tags: %s", r.stdout)
+	}
+
+	// Clear tags.
+	r = mustRun(t, db, "txn", "update", "-id", "1", "-clear-tags")
+	if !strings.Contains(r.stdout, "tags → (cleared)") {
+		t.Errorf("clear-tags stdout: %q", r.stdout)
+	}
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "新疆", "-json")
+	if strings.Contains(r.stdout, `"amount"`) {
+		t.Errorf("cleared tag should no longer match: %s", r.stdout)
+	}
+
+	// -tags and -clear-tags are mutually exclusive.
+	r = runCLI(t, db, "txn", "update", "-id", "1", "-tags", "a", "-clear-tags")
+	if r.code == 0 || !strings.Contains(r.stderr, "mutually exclusive") {
+		t.Errorf("expected mutual-exclusion error, code=%d stderr=%q", r.code, r.stderr)
+	}
+
+	// Unknown id on a tag edit must fail loudly.
+	r = runCLI(t, db, "txn", "update", "-id", "999", "-tags", "x")
 	if r.code == 0 || !strings.Contains(r.stderr, "not found") {
 		t.Errorf("expected not-found error, code=%d stderr=%q", r.code, r.stderr)
 	}

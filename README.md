@@ -81,6 +81,10 @@ flags filter on them:
   (OR). Multiple tags are comma-separated.
 - `report -tag <tag>` — restricts the summary to a **single** tag.
 
+Tags can be rewritten after the fact with `txn update -id <n> -tags <csv>`
+(replaces the whole list) or `-clear-tags`. Either combines with a category
+edit — e.g. `txn update -id 5 -tags 新疆 -category-name 交通` does both.
+
 Matching is by whole token, not substring: `-tags 新疆` matches a txn tagged
 `旅行,新疆` but does **not** match one tagged `新疆行`. LIKE wildcards (`%`, `_`)
 in a tag are treated literally. The tag filter ANDs with the caller's
