@@ -501,6 +501,20 @@ func (s *Store) UpdateTxnCategory(id int64, categoryID *int64) error {
 	return nil
 }
 
+// UpdateTxnTags replaces txn.tags with the given comma-separated string. Pass
+// an empty string to clear them. Returns an error if the txn id doesn't exist.
+func (s *Store) UpdateTxnTags(id int64, tags string) error {
+	res, err := s.DB.Exec(`UPDATE txn SET tags=? WHERE id=?`, nullIfEmpty(tags), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("txn #%d not found", id)
+	}
+	return nil
+}
+
 // scopeClause returns a SQL fragment + args that restrict `txn` to rows
 // belonging to the scope-person's family. Empty when no scope was requested.
 //

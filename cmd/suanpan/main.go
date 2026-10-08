@@ -596,51 +596,79 @@ func cmdTxn(args []string) error {
 		category := fs.Int64("category", 0, "new category id")
 		categoryName := fs.String("category-name", "", "new category name (resolved using txn's kind)")
 		clearCategory := fs.Bool("clear-category", false, "clear category (set to NULL)")
+		tags := fs.String("tags", "", "replace tags with a comma-separated list")
+		clearTags := fs.Bool("clear-tags", false, "clear tags")
 		asJSON := fs.Bool("json", false, "output JSON")
 		fs.Parse(rest)
 		if *id == 0 {
 			return errors.New("-id is required")
 		}
-		picks := 0
+		catPicks := 0
 		if *category != 0 {
-			picks++
+			catPicks++
 		}
 		if *categoryName != "" {
-			picks++
+			catPicks++
 		}
 		if *clearCategory {
-			picks++
+			catPicks++
 		}
-		if picks != 1 {
-			return errors.New("exactly one of -category, -category-name, -clear-category required")
+		tagPicks := 0
+		if *tags != "" {
+			tagPicks++
+		}
+		if *clearTags {
+			tagPicks++
+		}
+		if catPicks == 0 && tagPicks == 0 {
+			return errors.New("at least one of -category, -category-name, -clear-category, -tags, -clear-tags required")
+		}
+		if catPicks > 1 {
+			return errors.New("exactly one of -category, -category-name, -clear-category may be given")
+		}
+		if tagPicks > 1 {
+			return errors.New("-tags and -clear-tags are mutually exclusive")
 		}
 		s, err := openStore()
 		if err != nil {
 			return err
 		}
 		defer s.Close()
-		var catID *int64
-		switch {
-		case *clearCategory:
-			// catID stays nil
-		case *category != 0:
-			catID = category
-		default:
-			existing, err := s.GetTxn(*id)
-			if err != nil {
+
+		catEdit, tagEdit := catPicks == 1, tagPicks == 1
+		if catEdit {
+			var catID *int64
+			switch {
+			case *clearCategory:
+				// catID stays nil
+			case *category != 0:
+				catID = category
+			default:
+				existing, err := s.GetTxn(*id)
+				if err != nil {
+					return err
+				}
+				c, err := s.FindCategoryByName(*categoryName, existing.Kind)
+				if err != nil {
+					return err
+				}
+				if c == nil {
+					return fmt.Errorf("no category matches %q (kind=%s)", *categoryName, existing.Kind)
+				}
+				catID = &c.ID
+			}
+			if err := s.UpdateTxnCategory(*id, catID); err != nil {
 				return err
 			}
-			c, err := s.FindCategoryByName(*categoryName, existing.Kind)
-			if err != nil {
-				return err
-			}
-			if c == nil {
-				return fmt.Errorf("no category matches %q (kind=%s)", *categoryName, existing.Kind)
-			}
-			catID = &c.ID
 		}
-		if err := s.UpdateTxnCategory(*id, catID); err != nil {
-			return err
+		if tagEdit {
+			newTags := ""
+			if !*clearTags {
+				newTags = strings.Join(splitTags(*tags), ",")
+			}
+			if err := s.UpdateTxnTags(*id, newTags); err != nil {
+				return err
+			}
 		}
 		t, err := s.GetTxn(*id)
 		if err != nil {
@@ -649,11 +677,20 @@ func cmdTxn(args []string) error {
 		if *asJSON {
 			return emitJSON(t)
 		}
-		cat := "-"
-		if t.CategoryID != nil {
-			cat = strconv.FormatInt(*t.CategoryID, 10)
+		if catEdit {
+			cat := "-"
+			if t.CategoryID != nil {
+				cat = strconv.FormatInt(*t.CategoryID, 10)
+			}
+			fmt.Printf("txn #%d category → %s\n", t.ID, cat)
 		}
-		fmt.Printf("txn #%d category → %s\n", t.ID, cat)
+		if tagEdit {
+			if t.Tags == "" {
+				fmt.Printf("txn #%d tags → (cleared)\n", t.ID)
+			} else {
+				fmt.Printf("txn #%d tags → %s\n", t.ID, t.Tags)
+			}
+		}
 	case "rm":
 		fs := flag.NewFlagSet("txn rm", flag.ExitOnError)
 		id := fs.Int64("id", 0, "txn id")

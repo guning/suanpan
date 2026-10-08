@@ -345,6 +345,73 @@ func TestUpdateTxnCategory(t *testing.T) {
 	}
 }
 
+func TestUpdateTxnTags(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePerson("u", nil, "")
+	when := mustDate(t, "2026-04-10")
+
+	tx, err := s.CreateTxn(Txn{Kind: "expense", Amount: 100, PersonID: &p.ID, OccurredAt: when})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.Tags != "" {
+		t.Fatalf("expected untagged txn, got %q", tx.Tags)
+	}
+
+	// set tags on a txn that had none
+	if err := s.UpdateTxnTags(tx.ID, "旅行,新疆"); err != nil {
+		t.Fatalf("set tags: %v", err)
+	}
+	got, _ := s.GetTxn(tx.ID)
+	if got.Tags != "旅行,新疆" {
+		t.Errorf("tags=%q, want 旅行,新疆", got.Tags)
+	}
+
+	// replace existing tags
+	if err := s.UpdateTxnTags(tx.ID, "美食"); err != nil {
+		t.Fatalf("replace tags: %v", err)
+	}
+	got, _ = s.GetTxn(tx.ID)
+	if got.Tags != "美食" {
+		t.Errorf("tags=%q, want 美食", got.Tags)
+	}
+
+	// clear via empty string
+	if err := s.UpdateTxnTags(tx.ID, ""); err != nil {
+		t.Fatalf("clear tags: %v", err)
+	}
+	got, _ = s.GetTxn(tx.ID)
+	if got.Tags != "" {
+		t.Errorf("tags=%q, want empty", got.Tags)
+	}
+
+	// unknown id → error (bad ids must not silently succeed)
+	if err := s.UpdateTxnTags(999999, "新疆"); err == nil {
+		t.Error("expected error for unknown txn id")
+	}
+
+	// Round-trip: the write path and the tag-filter read path must agree.
+	if err := s.UpdateTxnTags(tx.ID, "旅行,新疆"); err != nil {
+		t.Fatal(err)
+	}
+	found, err := s.ListTxns(TxnFilter{Tags: []string{"新疆"}, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || found[0].ID != tx.ID || found[0].Tags != "旅行,新疆" {
+		t.Errorf("tag round-trip: got %+v, want the tagged txn", found)
+	}
+
+	// Whole-token semantics: a superstring must not match.
+	if err := s.UpdateTxnTags(tx.ID, "新疆行"); err != nil {
+		t.Fatal(err)
+	}
+	found, _ = s.ListTxns(TxnFilter{Tags: []string{"新疆"}, Limit: 100})
+	if len(found) != 0 {
+		t.Errorf("新疆行 should not match tag 新疆: %+v", found)
+	}
+}
+
 // ---------- categories ----------
 
 func TestFindCategoryByName(t *testing.T) {
