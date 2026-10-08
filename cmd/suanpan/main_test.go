@@ -237,6 +237,57 @@ func TestCLI_TxnUpdateCategory(t *testing.T) {
 	}
 }
 
+func TestCLI_TagFilter(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "s.db")
+	mustRun(t, db, "init")
+	mustRun(t, db, "person", "add", "-name", "u")
+
+	// Two tagged expenses plus one whose tag is a superstring and one untagged.
+	mustRun(t, db, "txn", "add", "-amount", "10", "-kind", "expense", "-person", "1", "-date", "2026-04-10", "-tags", "新疆")
+	mustRun(t, db, "txn", "add", "-amount", "20", "-kind", "expense", "-person", "1", "-date", "2026-04-11", "-tags", "旅行,新疆")
+	mustRun(t, db, "txn", "add", "-amount", "40", "-kind", "expense", "-person", "1", "-date", "2026-04-12", "-tags", "新疆行")
+	mustRun(t, db, "txn", "add", "-amount", "80", "-kind", "expense", "-person", "1", "-date", "2026-04-13")
+
+	// txn list -tags 新疆 → 10 + 20 only (whole-token; 40 excluded, 80 untagged).
+	r := mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "新疆", "-json")
+	if !strings.Contains(r.stdout, `"amount": 1000`) || !strings.Contains(r.stdout, `"amount": 2000`) {
+		t.Errorf("tag 新疆 should match amounts 1000 and 2000: %s", r.stdout)
+	}
+	if strings.Contains(r.stdout, `"amount": 4000`) || strings.Contains(r.stdout, `"amount": 8000`) {
+		t.Errorf("tag 新疆 must not match 新疆行 (4000) or untagged (8000): %s", r.stdout)
+	}
+
+	// Multiple tags OR.
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "旅行,新疆行", "-json")
+	if !strings.Contains(r.stdout, `"amount": 2000`) || !strings.Contains(r.stdout, `"amount": 4000`) {
+		t.Errorf("OR tags should match 2000 (旅行) and 4000 (新疆行): %s", r.stdout)
+	}
+	if strings.Contains(r.stdout, `"amount": 1000`) {
+		t.Errorf("OR tags should not match 1000: %s", r.stdout)
+	}
+
+	// No match → empty list.
+	r = mustRun(t, db, "txn", "list", "-as-person", "1", "-since", "2026-04-01", "-tags", "不存在", "-json")
+	if strings.Contains(r.stdout, `"amount"`) {
+		t.Errorf("unmatched tag should return no txns: %s", r.stdout)
+	}
+
+	// report -tag scopes the totals to the tagged subset.
+	r = mustRun(t, db, "report", "-as-person", "1", "-since", "2026-04-01", "-until", "2026-04-30", "-tag", "新疆", "-json")
+	if !strings.Contains(r.stdout, `"expense": 3000`) {
+		t.Errorf("report -tag 新疆 expense should be 3000: %s", r.stdout)
+	}
+	if strings.Contains(r.stdout, "4000") || strings.Contains(r.stdout, "8000") {
+		t.Errorf("report -tag 新疆 leaked untagged amounts: %s", r.stdout)
+	}
+
+	// Without -tag the full total is unchanged (byte-compatible behaviour).
+	r = mustRun(t, db, "report", "-as-person", "1", "-since", "2026-04-01", "-until", "2026-04-30", "-json")
+	if !strings.Contains(r.stdout, `"expense": 15000`) {
+		t.Errorf("unfiltered report expense should be 15000: %s", r.stdout)
+	}
+}
+
 func TestCLI_UnknownCommand(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "s.db")
 	r := runCLI(t, db, "foobar")
