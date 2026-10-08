@@ -61,15 +61,30 @@ Other families are invisible — this is enforced in the SQL layer, not just the
 ```sh
 suanpan family add -name "张家"
 suanpan person add -name "张三" -family 1
-suanpan txn add -amount 28.50 -kind expense -category-name 餐饮 -person 1 -payee 沙县小吃
+suanpan txn add -amount 28.50 -kind expense -category-name 餐饮 -person 1 -payee 沙县小吃 -tags 旅行,新疆
 suanpan txn add -amount 800 -kind expense -category-name 居住 -family 1 -payee 物业费
 suanpan budget add -name 月度 -period monthly -amount 3000 -owner person:1 -start 2026-01-01
 suanpan report     -as-person 1 -since 2026-04-01 -until 2026-04-30
+suanpan report     -as-person 1 -tag 新疆
 suanpan budget status -as-person 1
-suanpan txn list   -as-person 1 -limit 20 -json
+suanpan txn list   -as-person 1 -tags 新疆,旅行 -limit 20 -json
 ```
 
 Every list command supports `-json` for machine output.
+
+### Tag filtering
+
+`txn add` stores tags as a comma-separated string (`-tags 旅行,新疆`). Two read
+flags filter on them:
+
+- `txn list -tags <csv>` — returns txns tagged with **any** of the given tags
+  (OR). Multiple tags are comma-separated.
+- `report -tag <tag>` — restricts the summary to a **single** tag.
+
+Matching is by whole token, not substring: `-tags 新疆` matches a txn tagged
+`旅行,新疆` but does **not** match one tagged `新疆行`. LIKE wildcards (`%`, `_`)
+in a tag are treated literally. The tag filter ANDs with the caller's
+family-scope gate — it narrows, never widens, what a scoped reader can see.
 
 ## MCP server
 

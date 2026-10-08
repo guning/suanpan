@@ -409,6 +409,93 @@ func TestListTxnsFilters(t *testing.T) {
 	}
 }
 
+// ---------- tag filter ----------
+
+func TestListTxnsTagFilter(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePerson("u", nil, "")
+	when := mustDate(t, "2026-04-10")
+
+	// Distinct amounts identify rows in assertions.
+	mk := func(amount int64, tags string) {
+		t.Helper()
+		if _, err := s.CreateTxn(Txn{Kind: "expense", Amount: amount, PersonID: &p.ID, OccurredAt: when, Tags: tags}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(100, "新疆")          // exact single tag
+	mk(200, "旅行,新疆")      // 新疆 as a later token
+	mk(300, "新疆行")         // superstring — must NOT match "新疆"
+	mk(400, "旅行")          // 旅行 only
+	mk(500, "50%")          // tag containing a LIKE wildcard
+	mk(600, "")             // untagged
+	mk(700, "新疆,旅行,美食") // both tags
+
+	amounts := func(f TxnFilter) map[int64]bool {
+		t.Helper()
+		f.Limit = 100
+		got, err := s.ListTxns(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[int64]bool{}
+		for _, tx := range got {
+			m[tx.Amount] = true
+		}
+		return m
+	}
+
+	// Single tag exact match: only whole-token 新疆 rows (100, 200, 700 — not 300).
+	got := amounts(TxnFilter{Tags: []string{"新疆"}})
+	want := map[int64]bool{100: true, 200: true, 300: false, 400: false, 700: true}
+	for amt, w := range want {
+		if got[amt] != w {
+			t.Errorf("tag 新疆: amount=%d present=%v, want %v", amt, got[amt], w)
+		}
+	}
+
+	// Substring must not match: 新疆行 is a different token.
+	if got[300] {
+		t.Error("tag 新疆 leaked 新疆行 (substring matched)")
+	}
+
+	// Multiple tags OR together.
+	got = amounts(TxnFilter{Tags: []string{"新疆", "旅行"}})
+	for amt, w := range map[int64]bool{100: true, 200: true, 400: true, 700: true, 300: false, 500: false, 600: false} {
+		if got[amt] != w {
+			t.Errorf("tags 新疆,旅行: amount=%d present=%v, want %v", amt, got[amt], w)
+		}
+	}
+
+	// No match → empty.
+	got = amounts(TxnFilter{Tags: []string{"不存在"}})
+	if len(got) != 0 {
+		t.Errorf("unmatched tag should return empty, got %v", got)
+	}
+
+	// LIKE wildcards are literal: 50% matches only the 50% row, not 50 or 500.
+	got = amounts(TxnFilter{Tags: []string{"50%"}})
+	if !got[500] || len(got) != 1 {
+		t.Errorf("tag 50%%: got %v, want only amount 500", got)
+	}
+
+	// Tags compose with the scope gate (AND, not OR).
+	famA, _ := s.CreateFamily("A家", "CNY", "")
+	famB, _ := s.CreateFamily("B家", "CNY", "")
+	alice, _ := s.CreatePerson("alice", &famA.ID, "")
+	carl, _ := s.CreatePerson("carl", &famB.ID, "")
+	s.CreateTxn(Txn{Kind: "expense", Amount: 11, PersonID: &alice.ID, OccurredAt: when, Tags: "旅行"})
+	s.CreateTxn(Txn{Kind: "expense", Amount: 22, PersonID: &carl.ID, OccurredAt: when, Tags: "旅行"})
+
+	got = amounts(TxnFilter{Tags: []string{"旅行"}, ScopePersonID: alice.ID})
+	if !got[11] {
+		t.Errorf("alice should see her tagged txn: %v", got)
+	}
+	if got[22] {
+		t.Error("scope must still hide carl's tagged txn")
+	}
+}
+
 // ---------- family scope ----------
 
 // TestScopeRestrictsToFamily exercises the security gate: scoped queries must

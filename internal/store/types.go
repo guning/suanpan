@@ -69,7 +69,8 @@ type TxnFilter struct {
 	PersonID      int64
 	FamilyID      int64
 	CategoryID    int64
-	Search        string // match payee/note
+	Search        string   // match payee/note
+	Tags          []string // whole-token match against the comma-separated tags column; multiple values OR together
 	Limit         int
 	Offset        int
 	ScopePersonID int64

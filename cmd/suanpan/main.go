@@ -145,6 +145,18 @@ func resolveScopePerson(flagVal int64) (int64, error) {
 	return 0, errors.New("-as-person <id> is required (or set $SUANPAN_AS_PERSON); scoped reads only return your family's data")
 }
 
+// splitTags parses a comma-separated -tags value into trimmed, non-empty
+// tokens. A blank input yields nil (no filter).
+func splitTags(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func emitJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -537,6 +549,7 @@ func cmdTxn(args []string) error {
 		family := fs.Int64("family", 0, "family id")
 		category := fs.Int64("category", 0, "category id")
 		search := fs.String("search", "", "substring match in payee/note")
+		tags := fs.String("tags", "", "comma-separated tags; matches a txn carrying ANY of them (OR), whole-token")
 		limit := fs.Int("limit", 50, "limit")
 		asJSON := fs.Bool("json", false, "output JSON")
 		fs.Parse(rest)
@@ -552,7 +565,7 @@ func cmdTxn(args []string) error {
 		txns, err := s.ListTxns(store.TxnFilter{
 			Since: *since, Until: *until, Kind: *kind,
 			PersonID: *person, FamilyID: *family, CategoryID: *category,
-			Search: *search, Limit: *limit, ScopePersonID: scope,
+			Search: *search, Tags: splitTags(*tags), Limit: *limit, ScopePersonID: scope,
 		})
 		if err != nil {
 			return err
@@ -829,6 +842,7 @@ func cmdReport(args []string) error {
 	until := fs.String("until", "", "YYYY-MM-DD")
 	person := fs.Int64("person", 0, "further narrow by person id")
 	family := fs.Int64("family", 0, "further narrow by family id")
+	tag := fs.String("tag", "", "restrict to txns carrying this tag (whole-token match)")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
 
@@ -850,10 +864,14 @@ func cmdReport(args []string) error {
 		return err
 	}
 	defer s.Close()
+	var tagFilter []string
+	if t := strings.TrimSpace(*tag); t != "" {
+		tagFilter = []string{t}
+	}
 	sum, err := s.Summarize(store.TxnFilter{
 		Since: *since, Until: *until,
 		PersonID: *person, FamilyID: *family,
-		ScopePersonID: scope,
+		Tags: tagFilter, ScopePersonID: scope,
 	})
 	if err != nil {
 		return err

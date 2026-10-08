@@ -530,6 +530,31 @@ func scopeClause(scopePersonID int64) (string, []any) {
 	return frag, []any{scopePersonID, scopePersonID, scopePersonID}
 }
 
+// tagClause builds one LIKE predicate per tag and the matching args. Tags are
+// stored as a comma-separated list, so we match whole tokens by padding both
+// sides with a comma: "新疆" matches ",新疆," but not ",新疆行,". Multiple tags
+// are OR'd together. LIKE wildcards in user input are escaped literally.
+// Blank tags are ignored; an empty result means "no tag filter".
+func tagClause(tags []string) ([]string, []any) {
+	var ors []string
+	var args []any
+	for _, tag := range tags {
+		if tag == "" {
+			continue
+		}
+		ors = append(ors, `(',' || COALESCE(tags,'') || ',') LIKE ? ESCAPE '\'`)
+		args = append(args, "%,"+escapeLike(tag)+",%")
+	}
+	return ors, args
+}
+
+// escapeLike neutralizes LIKE wildcards so a tag such as "50%" is matched
+// literally. The replacer runs in a single pass, so escaped backslashes aren't
+// re-escaped. Callers must pair this with `ESCAPE '\'`.
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
 func (s *Store) ListTxns(f TxnFilter) ([]Txn, error) {
 	q := `SELECT id, occurred_at, kind, amount, currency,
 	             category_id, person_id, family_id, COALESCE(payee,''), COALESCE(note,''), COALESCE(tags,''), created_at
@@ -563,6 +588,11 @@ func (s *Store) ListTxns(f TxnFilter) ([]Txn, error) {
 		q += ` AND (payee LIKE ? OR note LIKE ?)`
 		like := "%" + f.Search + "%"
 		args = append(args, like, like)
+	}
+	if ors, tagArgs := tagClause(f.Tags); len(ors) > 0 {
+		// OR across tags; AND with every other filter (incl. scope).
+		q += ` AND (` + strings.Join(ors, " OR ") + `)`
+		args = append(args, tagArgs...)
 	}
 	if frag, scopeArgs := scopeClause(f.ScopePersonID); frag != "" {
 		q += frag
